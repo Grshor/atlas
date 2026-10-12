@@ -654,14 +654,19 @@ async function openDelegReview(it) {
    (↺ вернуть). Выполненные — приглушены и зачёркнуты. */
 const STEPS_CAP = 20;
 function stepsDoneCount(steps) { return (steps || []).filter((s) => s && s.done).length; }
-/* замена набора шагов целиком (PUT): один шаг переключён, остальные как были */
+/* замена набора шагов целиком (PUT): один шаг переключён, остальные как были.
+   Переключение сразу и в локальном наборе (it.steps): быстрый второй тумблер
+   и открытый следом диалог читают уже новый набор, а не снапшот на момент
+   рендера — иначе второй PUT молча затирает первый переключённый шаг. */
 async function toggleStep(it, step) {
-  const steps = (it.steps || []).map((s) => ({ text: s.text, done: s === step ? !s.done : !!s.done }));
+  step.done = !step.done;
+  const steps = (it.steps || []).map((s) => ({ text: s.text, done: !!s.done }));
   try {
     await api('/api/board/item/' + it.id + '/steps', jsonOpts('PUT', { steps }));
     log((step.done ? '↺ шаг снят: ' : '✓ шаг сделан: ') + (step.text || ''));
     loadBoard();
   } catch (e) {
+    step.done = !step.done; /* не сохранилось — возвращаем чекбокс как был */
     const c404 = String(e.message).indexOf('404') !== -1;
     log('✗ шаг не сохранён: ' + (c404 ? 'бэкенд без PUT steps' : e.message));
     loadBoard();
@@ -855,6 +860,7 @@ function editBoardItem(it) {
   const hasSteps = it && it.steps !== undefined;
   const origSteps = hasSteps ? (it.steps || []).map((s) => ({ text: String((s && s.text) || ''), done: !!(s && s.done) })) : null;
   const steps = hasSteps ? origSteps.map((s) => ({ text: s.text, done: s.done })) : null;
+  let stepsDirty = false; /* пользователь уже правил шаги — серверную правку не подставляем */
   if (hasSteps) {
     const strow = el('div', 'drow');
     strow.appendChild(el('label', null, 'шаги (чеклист)'));
@@ -868,20 +874,21 @@ function editBoardItem(it) {
         cb.type = 'checkbox';
         cb.checked = s.done;
         cb.title = 'шаг сделан';
-        cb.addEventListener('change', () => { s.done = cb.checked; });
+        cb.addEventListener('change', () => { s.done = cb.checked; stepsDirty = true; });
         const sinp = el('input', 'fld');
         sinp.type = 'text';
         sinp.spellcheck = false;
         sinp.autocomplete = 'off';
         sinp.value = s.text;
         sinp.placeholder = 'текст шага';
-        sinp.addEventListener('input', () => { s.text = sinp.value; });
+        sinp.addEventListener('input', () => { s.text = sinp.value; stepsDirty = true; });
         const x = el('button', 'mini', '✕');
         x.type = 'button';
         x.title = 'убрать шаг';
         x.addEventListener('click', () => {
           const i = steps.indexOf(s);
           if (i >= 0) steps.splice(i, 1);
+          stepsDirty = true;
           renderSteps();
         });
         r.append(cb, sinp, x);
@@ -892,13 +899,30 @@ function editBoardItem(it) {
       add.disabled = steps.length >= STEPS_CAP;
       add.title = steps.length >= STEPS_CAP ? 'не больше 20 шагов' : 'добавить пустой шаг';
       add.addEventListener('click', () => {
-        if (steps.length < STEPS_CAP) { steps.push({ text: '', done: false }); renderSteps(); }
+        if (steps.length < STEPS_CAP) { steps.push({ text: '', done: false }); stepsDirty = true; renderSteps(); }
       });
       slist.appendChild(add);
       strow.appendChild(slist);
     };
     renderSteps();
     dlg.appendChild(strow);
+    /* буфер шагов собран из карточки, которая могла устареть (тумблер перед
+       открытием диалога, правка из второго окна): перечитываем доску и, пока
+       пользователь ещё ничего не правил, тихо подменяем буфер на серверный
+       набор — иначе «Сохранить» PUT-ом затрёт чужую/свежую правку целиком */
+    api('/api/board').then((b) => {
+      if (stepsDirty || !ov.isConnected) return;
+      const pools = [b && b.q1, b && b.q2, b && b.q3, b && b.q4, b && b.done];
+      const fresh = pools.flat(Infinity).find((x) => x && x.id === it.id);
+      if (!fresh || !Array.isArray(fresh.steps)) return;
+      const incoming = fresh.steps.map((s) => ({ text: String((s && s.text) || ''), done: !!(s && s.done) }));
+      if (JSON.stringify(incoming) === JSON.stringify(steps)) return;
+      steps.length = 0;
+      for (const s of incoming) steps.push(s);
+      origSteps.length = 0;
+      for (const s of incoming) origSteps.push({ text: s.text, done: s.done });
+      renderSteps();
+    }).catch(() => {}); /* нет доски — работаем с тем, что было на карточке */
   }
 
   /* --- @-подсказка: попап в стиле mkSelect --- */
@@ -1086,14 +1110,22 @@ function renderBoard(data) {
   delegEnsureTick(); /* живые секунды на чипах «идёт» */
 }
 
+/* монотонный номер запроса доски: ответ, пришедший после более свежего
+   запроса (медленный GET, застрявший за PUT), молча выбрасывается — иначе
+   запоздалый снапшот перерисовывает доску назад и чекбоксы «отскакивают» */
+let boardFetchSeq = 0;
+
 async function loadBoard() {
+  const my = ++boardFetchSeq;
   try {
     const d = await api('/api/board');
+    if (my !== boardFetchSeq) return; /* устарел: свежий запрос уже рендерит */
     boardCache = d && typeof d === 'object' ? d : {};
     renderBoard(boardCache);
     hideErr('board');
     probeSet(true);
   } catch (e) {
+    if (my !== boardFetchSeq) return; /* ошибку обработает более свежий запрос */
     panelError('доска', e, 'board');
     scheduleRetry(loadBoard, 'board');
   }

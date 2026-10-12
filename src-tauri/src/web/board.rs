@@ -620,6 +620,60 @@ mod tests {
         );
     }
 
+    /// Racing double PUT (the frontend's fast-checkbox-toggles shape): two
+    /// REPLACEs in flight at once must land as ONE whole set — either the
+    /// first or the second, never a mix, never leftovers, no `item_steps`
+    /// row anomalies — and the winner must survive a subsequent board read.
+    #[tokio::test]
+    async fn board_steps_double_put_lands_intact() {
+        let r = test_router();
+        let (st, out) = call(
+            &r,
+            "POST",
+            "/api/board/item",
+            Some(r#"{"title":"двойной тумблер шагов","quadrant":"q3"}"#),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        let id = out["id"].as_i64().unwrap();
+
+        let body_a = r#"{"steps":[{"text":"шаг А","done":true},{"text":"шаг Б","done":false}]}"#;
+        let body_b = r#"{"steps":[{"text":"шаг А","done":false},{"text":"шаг Б","done":true}]}"#;
+        let uri_a = format!("/api/board/item/{id}/steps");
+        let uri_b = uri_a.clone();
+        let ra = call(&r, "PUT", &uri_a, Some(body_a));
+        let rb = call(&r, "PUT", &uri_b, Some(body_b));
+        let ((sta, outa), (stb, outb)) = tokio::join!(ra, rb);
+        assert_eq!(sta, StatusCode::OK, "{outa}");
+        assert_eq!(stb, StatusCode::OK, "{outb}");
+
+        // board read after the race: exactly one whole set survives, in order
+        let (_, board) = call(&r, "GET", "/api/board", None).await;
+        let item = board["q3"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == id)
+            .expect("item on the board");
+        let got: Vec<(String, bool)> = item["steps"]
+            .as_array()
+            .expect("steps array")
+            .iter()
+            .map(|s| {
+                (
+                    s["text"].as_str().expect("step text").to_string(),
+                    s["done"].as_bool().expect("step done"),
+                )
+            })
+            .collect();
+        let set_a = vec![("шаг А".to_string(), true), ("шаг Б".to_string(), false)];
+        let set_b = vec![("шаг А".to_string(), false), ("шаг Б".to_string(), true)];
+        assert!(
+            got == set_a || got == set_b,
+            "race must leave one whole set, got a mix: {got:?}"
+        );
+    }
+
     /// `atlas board …` CLI verbs end to end: the test serves the real router
     /// on an ephemeral port and drives the sync std-TCP client. The server
     /// lives on a DEDICATED OS thread with its own current_thread runtime —
