@@ -969,6 +969,12 @@ fn fork_session_file(src: &Path, old: &SessionHead, dest_dir: &Path) -> Result<P
             if line.is_empty() {
                 continue;
             }
+            // the original's own identity lines die here — micelium's scanner
+            // drops them the same way (entry lines only); the fork speaks
+            // with the fresh title/session pair written above
+            if line.starts_with("{\"type\":\"title\"") || line.starts_with("{\"type\":\"session\"") {
+                continue;
+            }
             let line = if line.contains(&src_token) {
                 line.replace(&src_token, &dst_token)
             } else {
@@ -4255,7 +4261,10 @@ mod tests {
         assert!(text.contains("\"previousSessionFiles\""), "{text}");
         assert!(text.contains("\"title\":\"Fork: дело\""), "{text}");
         assert!(text.contains("\"text\":\"три\""), "bodies stay verbatim");
-        assert_eq!(text.lines().count(), 5, "record count identical");
+        // 2 fresh identity lines + 3 records; the original's own title/session
+        // pair is replaced, not duplicated
+        assert_eq!(text.lines().count(), 5);
+        assert_eq!(text.matches("\"type\":\"session\"").count(), 1, "{text}");
 
         // the original is never touched
         let orig = std::fs::read_to_string(&src).unwrap();
