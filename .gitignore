@@ -1,0 +1,12 @@
+# build artifacts, logs and throwaway verification screenshots
+src-tauri/target/
+*.log
+*.db
+30s:
+mock.html
+/*.png
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+package-lock.json

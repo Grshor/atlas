@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "atlas",
+  "version": "0.1.0",
+  "identifier": "com.atlas.shell",
+  "build": {
+    "frontendDist": "../static"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "projects",
+        "title": "atlas — Проекты",
+        "url": "index.html?win=projects",
+        "width": 1180,
+        "height": 720,
+        "x": 60,
+        "y": 60,
+        "visible": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8787 ws://127.0.0.1:8787; img-src 'self' data:; font-src 'self' data:; frame-src 'self' http://127.0.0.1:* http://localhost:*;"
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

@@ -1,0 +1,1339 @@
+/* atlas — Win95-хром ВНУТРИ реальных окон (рамку рисует оконный менеджер).
+   Панель = одно окно, выбирается параметром ?win=…; html[data-win] задаёт панель.
+   Все цвета — из переменных палитры omarchy (--palette-*), которые рантайм
+   обновляет из GET /api/theme; фолбэк в :root. Без внешних URL и фреймворков.
+   color-scheme: dark — чтобы нативные виджеты WebKitGTK (выпадашки, чекбоксы,
+   спиннеры) рендерились тёмными, а не системно-светлыми. */
+
+:root {
+  color-scheme: dark;
+  --palette-accent: #faa968;
+  --palette-selection: #134e5a;
+  --palette-muted: #2a6b78;
+  --palette-background: #05182e;
+  --palette-dark-background: #031222;
+  --palette-darker-background: #020c17;
+  --palette-lighter-background: #0a2540;
+  --palette-foreground: #f6dcac;
+  --palette-light-foreground: #a7c9c6;
+  --palette-bright-foreground: #f6dcac;
+  --palette-red: #f85525;
+  --palette-yellow: #e97b3c;
+  --palette-green: #028391;
+  --palette-cyan: #8cbfb8;
+  --palette-blue: #3f8f8a;
+
+  --bevel-hi: var(--palette-light-foreground);
+  --bevel-mid: color-mix(in srgb, var(--palette-lighter-background) 50%, var(--palette-darker-background));
+  --bevel-lo: var(--palette-darker-background);
+  /* приглушённый текст: 75% светлого на тёмном — контраст ≥4.5:1 на всех фонах темы */
+  --dim-fg: color-mix(in srgb, var(--palette-light-foreground) 75%, var(--palette-dark-background));
+  /* «зелёный» для текста: подмешиваем светлый, иначе контраст зелёного 3.4:1 */
+  --ok-fg: color-mix(in srgb, var(--palette-green) 55%, var(--palette-bright-foreground));
+  --well: var(--palette-dark-background);
+  --hover-row: color-mix(in srgb, var(--palette-selection) 45%, transparent);
+  /* фон строки/разделитель: одна формула для таблиц, результатов, уведомлений */
+  --row-border: color-mix(in srgb, var(--palette-darker-background) 70%, transparent);
+
+  /* ПЕРФ: все производные цвета выше — фолбэк. Рантайм (applyDerivedColors в
+     app.js, сразу при старте и после каждой /api/theme) считает их в КОНКРЕТНЫЕ
+     rgb/rgba и переопределяет здесь же, на <html>. Причина: style-recalc при
+     смене :hover строки в WebKitGTK вычисляет color-mix() заново для каждого
+     элемента; литералы убирают эту работу с горячего пути наведения. */
+  --font-mono: ui-monospace, "JetBrains Mono NL", "JetBrains Mono", "Cascadia Mono",
+    "Fira Code", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden; /* панель никогда не прокручивается целиком */
+}
+
+body {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  background: var(--palette-background);
+  color: var(--palette-foreground);
+  font: 12.5px/1.45 var(--font-mono);
+}
+
+#app {
+  display: grid; /* панель внутри растягивается на всё окно */
+  min-height: 0;
+  min-width: 0;
+}
+
+::selection { background: var(--palette-selection); color: var(--palette-bright-foreground); }
+
+/* ---------- примитивы фаски (out / in / press) ---------- */
+.out, .btn95, .mini, .fld, .badge {
+  border: 1px solid;
+  border-color: var(--bevel-hi) var(--bevel-lo) var(--bevel-lo) var(--bevel-hi);
+  box-shadow: inset 1px 1px 0 var(--bevel-hi), inset -1px -1px 0 var(--bevel-lo);
+  background: var(--palette-lighter-background);
+}
+.in, .well {
+  border: 1px solid;
+  border-color: var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo);
+  box-shadow: inset 1px 1px 0 var(--bevel-lo), inset -1px -1px 0 var(--bevel-hi);
+  background: var(--well);
+}
+.press, .btn95:active, .mini:active {
+  border-color: var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo) !important;
+  box-shadow: inset 1px 1px 0 var(--bevel-lo), inset -1px -1px 0 var(--bevel-hi) !important;
+}
+
+/* ---------- кнопки и поля ---------- */
+button { font: inherit; color: var(--palette-foreground); }
+.btn95 {
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn95:hover, .mini:hover { background: var(--hover-row); }
+.btn95:disabled, .mini:disabled { color: var(--dim-fg); cursor: default; }
+.mini {
+  font: inherit;
+  font-size: 11px;
+  padding: 0 5px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.fld {
+  font: inherit;
+  color: var(--palette-foreground);
+  background: var(--well);
+  padding: 3px 6px;
+  min-width: 0;
+  border-color: var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo);
+  box-shadow: inset 1px 1px 0 var(--bevel-lo);
+}
+.fld::placeholder { color: var(--dim-fg); }
+.fld:focus, .msel:focus-visible { outline: 1px dotted var(--palette-accent); outline-offset: -3px; }
+/* выпадающий список mkSelect (нативных select в UI нет): закрытая кнопка — как
+   поле с фаской, открытый список рисуем сами в палитре темы. */
+.msel {
+  font: inherit;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 1px 2px 1px 6px;
+  cursor: pointer;
+  color: var(--palette-bright-foreground);
+  background: var(--palette-lighter-background);
+  border: 1px solid;
+  border-color: var(--bevel-hi) var(--bevel-lo) var(--bevel-lo) var(--bevel-hi);
+  box-shadow: inset 1px 1px 0 var(--bevel-hi), inset -1px -1px 0 var(--bevel-lo);
+}
+.msel:hover:not(:disabled) { background: var(--hover-row); }
+.msel:disabled { color: var(--dim-fg); cursor: default; }
+.msel.open { outline: 1px dotted var(--palette-accent); outline-offset: -3px; }
+.msel-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msel-caret { flex: none; font-size: 8px; line-height: 1; color: var(--dim-fg); }
+.msel-pop {
+  position: fixed; /* карточки доски живут в скроллящемся контейнере — от кнопки по rect */
+  z-index: 90;
+  padding: 2px;
+  background: var(--palette-lighter-background);
+  border: 1px solid;
+  border-color: var(--bevel-hi) var(--bevel-lo) var(--bevel-lo) var(--bevel-hi);
+  box-shadow: 2px 2px 0 color-mix(in srgb, var(--palette-darker-background) 70%, transparent);
+}
+.msel-list { max-height: 40vh; overflow: auto; overscroll-behavior: contain; }
+.msel-opt {
+  padding: 2px 8px;
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+  color: var(--palette-bright-foreground);
+}
+.msel-opt.active { background: var(--palette-selection); }
+.msel-opt.sel { color: var(--palette-accent); }
+/* чекбоксы: явный акцент и размер, чтобы не зависеть от системной темы */
+input[type="checkbox"] {
+  accent-color: var(--palette-accent);
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  cursor: pointer;
+}
+
+/* ---------- каркас панели: тулбар / содержимое / статус-строка ---------- */
+.panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 6px;
+  padding: 8px;
+  min-height: 0;
+  min-width: 0;
+  position: relative; /* встроенный экран настроек — absolute-слой поверх панели */
+}
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px;
+  flex-wrap: wrap;
+}
+.toolbar .spacer { flex: 1; }
+.scroll { overflow: auto; min-height: 0; }
+.grow { min-height: 0; }
+.dim { color: var(--dim-fg); }
+.hidden { display: none !important; }
+
+.errbox {
+  border: 1px solid var(--palette-red);
+  border-left: 4px solid var(--palette-red);
+  background: color-mix(in srgb, var(--palette-red) 12%, var(--well));
+  padding: 4px 8px;
+  margin: 0 8px 8px;
+}
+
+/* ---------- хост-окно «проекты»: вкладки свёрнутых панелей.
+   data-win выставляется на <html>, поэтому селектор без тега. ---------- */
+[data-win="projects"] #app { display: flex; flex-direction: column; }
+#tabbar { flex: none; min-height: 0; }
+.tabbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  padding: 0 6px;
+  min-width: 0;
+  overflow-x: auto;
+}
+.tab95 {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  color: var(--dim-fg);
+  background: var(--palette-lighter-background);
+  border: 1px solid;
+  border-color: var(--bevel-hi) var(--bevel-lo) var(--palette-background) var(--bevel-hi);
+  border-radius: 3px 3px 0 0;
+}
+.tab95:hover { color: var(--palette-bright-foreground); background: var(--hover-row); }
+.tab95:focus-visible { outline: 1px dotted var(--palette-accent); outline-offset: -3px; }
+.tab95.active {
+  color: var(--palette-bright-foreground);
+  font-weight: bold;
+  background: var(--well);
+  border-bottom-color: var(--well);
+}
+.tab95 .mini { padding: 0 3px; }
+#host-projects, #host-tab { flex: 1 1 auto; min-height: 0; min-width: 0; }
+#host-projects { display: flex; flex-direction: column; }
+#host-projects > .panel { flex: 1; }
+#host-tab:not(.hidden) { display: grid; }
+#host-tab > .tabpage {
+  grid-area: 1 / 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+#host-tab > .tabpage > .panel { flex: 1; }
+
+/* ---------- статус-строка (футер каждого окна): chrome + log + probe ---------- */
+#statusbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 8px;
+  min-width: 0;
+  border-top: 1px solid var(--bevel-lo);
+  box-shadow: inset 0 1px 0 var(--bevel-hi);
+  background: var(--palette-lighter-background);
+}
+#chrome {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  flex: 0 0 auto; /* хром не сжимается никогда: длинный журнал (flex-basis auto)
+                     при proportional-shrink съел бы 🔔 — сжимается только .log */
+}
+#chrome > * { flex: none; }
+#chrome .btn95 { padding: 1px 8px; font-size: 11px; }
+/* колокольчик уведомлений: маленький, хром не растит; N>0 — акцент */
+#chrome .bell { font-size: 11px; padding: 1px 6px; color: var(--dim-fg); flex: none; }
+#chrome .bell.bell-hot {
+  color: var(--palette-accent);
+  border-color: var(--palette-accent);
+}
+/* оконные операции, погашенные состоянием /api/ui (gui:false | port_owner:other) */
+.mini.gate-dim, .btn95.gate-dim { opacity: .6; }
+/* журнал — строго одна строка: многоточие вместо переноса, полный текст в
+   title; сжимается первым, хром (🔔) и зонд не вытесняются никогда */
+#statusbar .log {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim-fg);
+}
+#statusbar .probe { flex: none; padding: 1px 8px; font-size: 11px; white-space: nowrap; }
+#statusbar .probe.ok::before { content: "● "; color: var(--ok-fg); }
+#statusbar .probe.down { color: var(--palette-red); }
+#statusbar .probe.down::before { content: "● "; color: var(--palette-red); }
+/* режимы видимости статус-строки (ui.statusbar): always | hover | hidden.
+   Кнопки-дублёры в тулбарах (.tb-fallback) видны только когда строка скрыта. */
+body[data-sb="hidden"] #statusbar { display: none; }
+body:not([data-sb="hidden"]) .tb-fallback { display: none; }
+body[data-sb="hover"] #statusbar {
+  height: 6px;
+  padding-top: 0;
+  padding-bottom: 0;
+  overflow: hidden;
+}
+body[data-sb="hover"]:hover #statusbar,
+body[data-sb="hover"]:focus-within #statusbar {
+  height: auto;
+  padding-top: 3px;
+  padding-bottom: 3px;
+}
+
+/* ---------- таблицы ---------- */
+.tbl { border-collapse: collapse; width: 100%; }
+.tbl th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  text-align: left;
+  font-weight: normal;
+  font-size: 11px;
+  color: var(--dim-fg);
+  background: var(--palette-lighter-background);
+  border-bottom: 1px solid var(--bevel-lo);
+  box-shadow: inset -1px -1px 0 var(--bevel-mid);
+  padding: 3px 8px;
+  white-space: nowrap;
+}
+.tbl td {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--row-border);
+  vertical-align: top;
+  white-space: nowrap;
+}
+.tbl td.wrap { white-space: normal; word-break: break-all; }
+.tbl tbody tr { cursor: pointer; }
+.tbl tbody tr:focus-visible { outline: 1px dotted var(--palette-accent); outline-offset: -2px; }
+.tbl tbody tr:hover { background: var(--hover-row); }
+.tbl tbody tr.sel { background: var(--palette-selection); }
+.tbl tbody tr.sel .dim, .tbl tbody tr.sel .badge.off { color: var(--palette-bright-foreground); opacity: .75; }
+.tbl .num { text-align: right; font-variant-numeric: tabular-nums; }
+.path-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+
+/* =====================================================================
+   Tabulator (грид проектов): перекраска под omarchy-палитру + Win95-фаски.
+   Вендорный tabulator.min.css не знает наших переменных — перебиваем классы.
+   =================================================================== */
+.tabulator {
+  position: relative;
+  font: 12.5px/1.45 var(--font-mono);
+  color: var(--palette-foreground);
+  background: var(--well);
+  border: 1px solid;
+  border-color: var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo);
+  box-shadow: inset 1px 1px 0 var(--bevel-lo), inset -1px -1px 0 var(--bevel-hi);
+  text-align: left;
+  overflow: hidden;
+}
+.tabulator .tabulator-tableholder { background: var(--well); }
+/* ВАЖНО: вендор красит белёсым не только .tabulator и .tabulator-row, но и
+   внутренний .tabulator-table (#fff) — именно он виден там, где строки
+   прозрачны, и именно его пропускал прежний набор переопределений (отсюда
+   «белая» таблица в WebKitGTK). Селектор — ровно вендорный (0,3,0), наш файл
+   подключён позже, поэтому выигрываем порядком. */
+.tabulator .tabulator-tableholder .tabulator-table {
+  background: transparent;
+  color: var(--palette-foreground);
+}
+/* шапка: как .tbl th — липкая, приглушённая, с фаской снизу */
+.tabulator .tabulator-header {
+  background: var(--palette-lighter-background);
+  border-bottom: 1px solid var(--bevel-lo);
+  box-shadow: inset -1px -1px 0 var(--bevel-mid);
+}
+/* вендорный селектор — .tabulator .tabulator-header .tabulator-col (0,3,0):
+   наш прежний .tabulator .tabulator-col (0,2,0) проигрывал специфичности,
+   и шапка оставалась светло-серой (#e6e6e6) */
+.tabulator .tabulator-header .tabulator-col {
+  background: var(--palette-lighter-background);
+  border-right: 1px solid var(--bevel-mid);
+}
+/* вендорный hover шапки — .tabulator .tabulator-header .tabulator-col.
+   tabulator-sortable.tabulator-col-sorter-element:hover (0,6,0, внутри
+   @media (hover:hover)) красил колонку в #cdcdcd. Специфичность должна быть
+   РОВНО вендорной (0,5,0 проигрывает) — наш файл позже, выигрывает порядок. */
+.tabulator .tabulator-header .tabulator-col.tabulator-sortable.tabulator-col-sorter-element:hover {
+  background: var(--hover-row);
+}
+/* перетаскивание колонки и range-подсветка (вендор: #cdcdcd / #d6d6d6 / #3876ca) */
+.tabulator .tabulator-header .tabulator-col.tabulator-moving { background: var(--palette-lighter-background); }
+.tabulator .tabulator-header .tabulator-col.tabulator-range-highlight {
+  background-color: var(--hover-row);
+  color: var(--palette-foreground);
+}
+.tabulator .tabulator-header .tabulator-col.tabulator-range-selected {
+  background-color: var(--palette-selection);
+  color: var(--palette-bright-foreground);
+}
+.tabulator .tabulator-col-content { padding: 3px 5px; }
+.tabulator .tabulator-col-title {
+  font-size: 11px;
+  font-weight: normal;
+  color: var(--dim-fg);
+  white-space: nowrap;
+}
+.tabulator .tabulator-col.tabulator-sortable .tabulator-col-title { color: var(--palette-foreground); }
+.tabulator .tabulator-col.tabulator-sortable:hover .tabulator-col-title { color: var(--palette-bright-foreground); }
+/* стрелки сортировки: свой headerSortElement рисует ↕/▲/▼ */
+.tabulator .tabulator-col .sortmark { color: var(--dim-fg); margin-left: 4px; font-size: 9px; }
+.tabulator .tabulator-col[aria-sort="ascending"] .sortmark { color: var(--palette-accent); }
+.tabulator .tabulator-col[aria-sort="descending"] .sortmark { color: var(--palette-accent); }
+/* ячейки и строки */
+.tabulator .tabulator-cell {
+  padding: 3px 5px;
+  border-right: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: top;
+}
+.tabulator .tabulator-row,
+.tabulator .tabulator-row.tabulator-row-even { background: transparent; } /* вендор полосит светло-серым */
+/* Ключ к отзывчивости прокрутки: строка — своя граница перерисовки (contain:paint).
+   Без неё смена :hover под курсором при прокрутке инвалидирует заметную часть
+   грида. Замер (CDP, 60 строк, 90 колёсных шагов с курсором над строками,
+   прокрутка 983px): без contain — Paint 66 мс, HitTest 24 мс, TaskDuration 0.112 с;
+   с contain — Paint 15 мс, HitTest 16 мс, TaskDuration 0.071 с (RasterTask ~50 мс
+   в обоих). Внешний вид и подсказки не меняются: фаски, чипы и кнопки и так
+   рисуются внутри границ строки (у ячеек вендорный overflow: hidden). */
+.tabulator .tabulator-row {
+  min-height: 25px;
+  border-bottom: 1px solid var(--row-border);
+  contain: paint;
+}
+.tabulator .tabulator-row.tabulator-selectable:hover { background: var(--hover-row); cursor: pointer; }
+.tabulator .tabulator-row.tabulator-selected { background: var(--palette-selection) !important; color: var(--palette-bright-foreground); }
+.tabulator .tabulator-row.tabulator-selected:hover { background: var(--palette-selection); }
+.tabulator .tabulator-row.tabulator-selected .dim,
+.tabulator .tabulator-row.tabulator-selected .badge.off { color: var(--palette-bright-foreground); opacity: .75; }
+/* маркер выбранной строки — как раньше: › перед именем в ячейке «проект».
+   ВАЖНО: не ::before. Псевдоэлемент перед блочным <div> внутри ячейки создаёт
+   анонимную строку ВЫШЕ него: див с именем уезжал на вторую строку и обрезался
+   (ячейка 25px, у вендора overflow:hidden) — выбранная строка выглядела пустой.
+   Настоящий span живёт в том же потоке, что и имя; место под него занято всегда,
+   выбор только переключает visibility — ни перерисовки, ни сдвига, ни обрезки. */
+.tabulator .tabulator-row .tabulator-cell.cell-name .sel-mark { visibility: hidden; margin-right: 4px; }
+.tabulator .tabulator-row.tabulator-selected .tabulator-cell.cell-name .sel-mark { visibility: visible; }
+.tabulator .tabulator-row:focus { outline: 1px dotted var(--palette-accent); outline-offset: -2px; }
+/* путь в гриде: колонка без ширины впитывает остаток (fitColumns) и НЕ должна
+   распираться длинным путём — режем многоточием на краю ячейки. Базовый
+   .path-cell (max-width:260px, для подвала-таблицы) здесь перекрывается;
+   клик по пути копирует его — курсор и подсветка как у ссылки (pathCell). */
+.tabulator .tabulator-cell.cell-path .path-cell { max-width: 100%; }
+.tabulator .tabulator-cell.cell-path .path-cell.copyable { cursor: pointer; }
+.tabulator .tabulator-cell.cell-path .path-cell.copyable:hover { color: var(--palette-bright-foreground); }
+/* группы: заголовок-фаска, сворачивание кликом, счётчик внутри */
+.tabulator .tabulator-group {
+  background: var(--palette-lighter-background);
+  border-bottom: 1px solid var(--bevel-lo);
+  box-shadow: inset -1px -1px 0 var(--bevel-mid);
+  color: var(--dim-fg);
+  font-size: 11px;
+  font-weight: normal;
+}
+.tabulator .tabulator-group:hover { color: var(--palette-bright-foreground); background: var(--hover-row); }
+.tabulator .tabulator-group span { margin-left: 10px; color: inherit; }
+.tabulator .tabulator-group .tabulator-arrow { border-left-color: var(--dim-fg); border-top-color: var(--dim-fg); border-bottom-color: transparent; }
+.tabulator .tabulator-group.tabulator-group-visible .tabulator-arrow { border-left-color: transparent; border-top-color: var(--palette-accent); }
+/* пустая таблица */
+.tabulator .tabulator-placeholder { background: var(--well); }
+.tabulator .tabulator-placeholder-contents { color: var(--dim-fg); font-size: 11.5px; }
+/* зона перетаскивания ширины колонки */
+.tabulator .tabulator-col-resize-handle:hover { background: var(--hover-row); }
+.tabulator .tabulator-header .tabulator-col.tabulator-resizing { background: var(--hover-row); }
+/* расчленённые остатки ручных ширин ниже не нужны: layout и persistence —
+   библиотечные; .tbl, .path-cell, .rowbtns, .fb остаются общими */
+
+/* архив выброшенных проектов — сворачиваемый блок под таблицей */
+details.arch { margin: 4px 0 0; }
+details.arch > summary {
+  cursor: pointer;
+  user-select: none;
+  color: var(--dim-fg);
+  font-size: 11px;
+  padding: 3px 8px;
+}
+details.arch > summary:hover { color: var(--palette-bright-foreground); }
+/* краткий результат действия фокуса прямо в строке */
+.fb { margin-left: 4px; font-size: 11px; }
+.fok { color: var(--ok-fg); }
+.ferr { color: var(--palette-red); cursor: help; }
+
+/* ---------- значки и чипы ---------- */
+.badge {
+  display: inline-block;
+  font-size: 10px;
+  line-height: 1.4;
+  padding: 0 4px;
+  margin-right: 2px;
+}
+.badge.off { color: var(--dim-fg); background: transparent; border-style: dashed; box-shadow: none; opacity: .6; }
+.badge.on { color: var(--palette-bright-foreground); }
+.badge.k-yellow { color: var(--palette-yellow); }
+.badge.k-cyan { color: var(--palette-cyan); }
+.badge.k-green { color: var(--ok-fg); }
+/* квадратные значки источников (H/S/G/V/Z): фиксированные 14×14, зазор 2px */
+.badge.sq {
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  margin: 0 2px 0 0;
+  line-height: 12px;
+  text-align: center;
+  vertical-align: middle;
+  box-sizing: border-box;
+}
+.chip {
+  display: inline-block;
+  font-size: 10.5px;
+  padding: 0 5px;
+  margin: 0 3px 2px 0;
+  border: 1px solid var(--bevel-mid);
+  background: color-mix(in srgb, var(--palette-lighter-background) 60%, transparent);
+  white-space: nowrap;
+}
+.chip.click { cursor: pointer; }
+.chip.click:hover { border-color: var(--palette-accent); color: var(--palette-bright-foreground); }
+.chip.proj { border-color: var(--palette-muted); }
+.dep-strict { color: var(--palette-red); }
+.dep-soft { color: var(--dim-fg); }
+.sel-mark { color: var(--palette-accent); }
+
+/* ---------- панель «проекты»: кнопки фокуса в строке ---------- */
+/* inline-flex: рядом с ними в той же ячейке живёт ✓/✗ (span.fb) — строка не растёт */
+.rowbtns { display: inline-flex; gap: 3px; }
+.rowbtns .mini { min-width: 20px; text-align: center; }
+/* избранное: мини-кнопка ★/☆ первой в ячейке фокуса + звёздочка перед именем
+   строки; залитая ★ — акцентом, контурная ☆ остаётся обычным цветом кнопки */
+.mini.fav.on { color: var(--palette-accent); }
+.favmark {
+  color: var(--palette-accent);
+  opacity: .9;
+  font-size: 11px;
+  margin-right: 3px;
+}
+.ag-ok { color: var(--ok-fg); }
+.ag-work { color: var(--palette-yellow); }
+.ag-none { color: var(--dim-fg); }
+
+/* ---------- панель «доска»: Эйзенхауэр 2×2 + разделитель рядов ---------- */
+.quad-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  min-height: 0;
+}
+.quad-grid > .q1 { grid-row: 1; grid-column: 1; }
+.quad-grid > .q2 { grid-row: 1; grid-column: 2; }
+.quad-grid > .q3 { grid-row: 3; grid-column: 1; }
+.quad-grid > .q4 { grid-row: 3; grid-column: 2; }
+/* перетаскиваемый разделитель между верхним (q1/q2) и нижним (q3/q4) рядом */
+.board-split {
+  grid-row: 2;
+  grid-column: 1 / -1;
+  min-height: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: row-resize;
+}
+.board-split::before {
+  content: "";
+  width: 100%;
+  height: 2px;
+  background: var(--bevel-mid);
+}
+.board-split:hover::before, .board-split.drag::before { background: var(--palette-accent); }
+body.rowsizing, body.rowsizing * { cursor: row-resize !important; user-select: none !important; }
+.quad {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 4px;
+  padding: 5px;
+  min-height: 0;
+  min-width: 0;
+}
+.quad > header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+}
+.quad > header .ttl { flex: 1; }
+.quad > header .mark::before { content: "■ "; }
+.quad.q1 { border-color: color-mix(in srgb, var(--palette-red) 55%, var(--bevel-hi)) var(--bevel-lo) var(--bevel-lo) color-mix(in srgb, var(--palette-red) 55%, var(--bevel-hi)); }
+.quad.q1 .mark { color: var(--palette-red); }
+.quad.q2 .mark { color: var(--ok-fg); }
+.quad.q3 .mark { color: var(--palette-yellow); }
+.quad.q4 .mark { color: var(--dim-fg); }
+.cards { padding: 4px; overflow: auto; display: flex; flex-direction: column; gap: 5px; }
+.card { padding: 4px 6px; font-size: 12px; }
+.card.card-sel {
+  border-color: var(--palette-accent);
+  background: color-mix(in srgb, var(--palette-accent) 10%, var(--palette-lighter-background));
+}
+.card .card-title { margin-bottom: 3px; }
+/* чеклист дела (steps): компактные чекбоксы под превью описания;
+   сделанный шаг — приглушён и зачёркнут; счётчик 2/5 — у заголовка */
+.card .card-title .steps-count { color: var(--dim-fg); font-size: 10px; margin-left: 5px; }
+.card .steps { display: flex; flex-direction: column; gap: 1px; margin: 1px 0 3px; }
+.card .step {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 11px;
+  cursor: pointer;
+  min-width: 0;
+}
+.card .step input { flex: none; }
+.card .step .step-text { flex: 1; min-width: 0; word-break: break-word; }
+.card .step.done { color: var(--dim-fg); }
+.card .step.done .step-text { text-decoration: line-through; }
+/* шаги в диалоге дела — как файлы: строка чекбокс + текст + ✕ */
+.dlg .step-row { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
+.dlg .step-row .fld { flex: 1; min-width: 0; padding: 1px 6px; font-size: 11.5px; }
+.dlg .step-row .mini { flex: none; }
+.dlg .step-add { margin-bottom: 4px; }
+.card .card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; font-size: 10.5px; }
+.card .card-meta .push { margin-left: auto; }
+.quad > header .qcount { color: var(--dim-fg); font-size: 11px; }
+/* ---------- делегация дел (доска): чип состояния, кнопка ▶, модалки ---------- */
+.chip.deleg { cursor: pointer; }
+.chip.deleg-queued { color: var(--dim-fg); border-color: var(--bevel-mid); background: transparent; }
+.chip.deleg-running { color: var(--palette-accent); border-color: var(--palette-accent); }
+.chip.deleg-review { color: var(--palette-yellow); border-color: var(--palette-yellow); }
+.chip.deleg-failed { color: var(--palette-red); border-color: var(--palette-red); }
+.card .card-title .chip.deleg { margin-left: 5px; }
+.chip.deleg .deleg-secs { font-variant-numeric: tabular-nums; }
+/* ТЗ для делегирования: read-only моноблок со скроллом */
+.deleg-brief {
+  font: 11px/1.45 var(--font-mono);
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  width: min(72vw, 640px);
+  max-height: 42vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  background: var(--well);
+  border: 1px solid;
+  border-color: var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo);
+}
+.deleg-cwd {
+  font: 11px var(--font-mono);
+  color: var(--dim-fg);
+  margin: -4px 0 6px;
+  word-break: break-all;
+  user-select: text;
+}
+/* живой лог делегации — тот же вывод, что у make (класс tasks-out) */
+.dlg .tasks-out.deleg-log { width: min(76vw, 720px); max-height: 46vh; margin-bottom: 8px; }
+.dlg .tasks-out.deleg-log .exit { display: block; margin-top: 2px; }
+/* провал в журнале: предполагаемая причина ведёт, сырой хвост свёрнут */
+.dlg .tasks-out.deleg-log .deleg-cause .dl-stat {
+  color: var(--dim-fg); white-space: pre-wrap; word-break: break-word; margin-bottom: 2px;
+}
+.dlg .tasks-out.deleg-log .deleg-cause .deleg-err { margin-top: 0; }
+.dlg .tasks-out.deleg-log details.deleg-tail { margin-top: 6px; }
+.dlg .tasks-out.deleg-log details.deleg-tail summary {
+  cursor: pointer; color: var(--dim-fg); user-select: none;
+}
+.dlg .tasks-out.deleg-log details.deleg-tail summary:hover { color: var(--palette-bright-foreground); }
+.dlg .tasks-out.deleg-log details.deleg-tail .deleg-brief { margin-top: 4px; width: 100%; max-height: 24vh; }
+/* диф ревью: stat-строка + строки с классами dl-add / dl-del / dl-hdr / dl-trunc */
+.deleg-diff {
+  font: 11px/1.4 var(--font-mono);
+  width: min(80vw, 780px);
+  max-height: 48vh;
+  overflow: auto;
+  padding: 4px 6px;
+  user-select: text;
+  background: var(--well);
+  border: 1px solid;
+  border-color: var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo);
+}
+.deleg-diff .dl-stat { color: var(--dim-fg); white-space: pre-wrap; word-break: break-all; margin-bottom: 4px; }
+.deleg-diff .dl-line { min-height: 1.4em; white-space: pre-wrap; word-break: break-word; }
+.deleg-diff .dl-add { color: var(--ok-fg); }
+.deleg-diff .dl-del { color: var(--palette-red); }
+.deleg-diff .dl-hdr { color: var(--dim-fg); }
+.deleg-diff .dl-trunc { color: var(--palette-yellow); }
+.deleg-err { color: var(--palette-red); white-space: pre-wrap; word-break: break-word; margin-top: 6px; }
+.dlg .deleg-rej .fld { width: 100%; font: inherit; resize: vertical; }
+.dlg .deleg-rej-send { margin-top: 4px; align-self: flex-start; }
+/* восстановление провала на карточке: кнопки рядом, раскрытый фидбек — колонкой */
+.card .deleg-failed-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 3px 0; }
+.card .deleg-failed-row .deleg-rej { flex: 1 1 100%; display: grid; gap: 2px; }
+.card .deleg-failed-row .deleg-rej label { font-size: 11px; color: var(--dim-fg); }
+.card .deleg-failed-row .deleg-rej .fld { width: 100%; font: inherit; resize: vertical; }
+.card .deleg-failed-row .deleg-rej-send { justify-self: start; }
+.card .deleg-resume { color: var(--palette-yellow); }
+
+/* блок выполненных дел — один на всю доску, внизу панели, свёрнут по умолчанию */
+.done-block { margin: 0; }
+.done-block > summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 11.5px;
+  padding: 3px 8px;
+  color: var(--dim-fg);
+}
+.done-block > summary:hover { color: var(--palette-bright-foreground); }
+.done-list { display: flex; flex-direction: column; gap: 5px; padding: 4px; overflow: auto; max-height: 30vh; }
+.done-sum { font-size: 11px; padding: 0 8px 4px; }
+.card.card-done { opacity: .6; }
+.card.card-done .card-title { text-decoration: line-through; }
+/* описание дела на карточке: прижато к 3 строкам с многоточием; целиком — в
+   title и в диалоге (клик по превью открывает диалог) */
+.card .card-desc {
+  margin: 0 0 3px;
+  font-size: 11.5px;
+  color: var(--dim-fg);
+  cursor: pointer;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+.card .card-desc:hover { color: var(--palette-foreground); }
+/* файлы дела — тем же чипом, но пунктиром, чтобы не путать с зависимостями */
+.chip.file { border-style: dashed; }
+/* диалог дела: многострочное описание + файлы с ✕ и «+ файл» с подсказкой */
+.dlg textarea.fld { width: 100%; font: inherit; resize: vertical; min-height: 64px; }
+.dlg .drow.off > :not(label) { opacity: .55; }
+.dlg .att-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 4px; }
+.dlg .att-row { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
+.dlg .att-row .att-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dlg .att-row .mini { flex: none; }
+.dlg .att-add .fld { width: 100%; }
+.att-pop .msel-opt { overflow: hidden; text-overflow: ellipsis; max-width: 70vw; }
+
+/* ---------- панель «зависимости»: ASCII-граф + происхождение ---------- */
+.deps-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 4px 8px;
+  font-size: 11.5px;
+  color: var(--dim-fg);
+  background: var(--palette-lighter-background);
+  border: 1px solid;
+  border-color: var(--bevel-hi) var(--bevel-lo) var(--bevel-lo) var(--bevel-hi);
+}
+.deps-head .spacer { flex: 1; }
+.graph { padding: 8px 10px; font-size: 12.5px; }
+.gl { white-space: pre; padding: 1px 0; }
+.gl.sel-edge { font-weight: bold; }
+.gl.sel-edge::before { content: "› "; color: var(--palette-accent); }
+.gl .arr-strict { color: var(--palette-red); }
+.gl .arr-soft { color: var(--dim-fg); }
+.gl .note { color: var(--dim-fg); }
+.gl .dep-src { margin-left: 8px; }
+.cycle { color: var(--palette-red); white-space: pre-wrap; padding: 1px 0; }
+.dsum { margin: 0; padding: 3px 8px; font-size: 11.5px; }
+.dwarn { margin: 0 8px; font-size: 11px; white-space: pre-wrap; }
+
+/* ---------- панель «поиск» ---------- */
+/* форма и предупреждение о векторе — одна auto-строка: скрытый #vecwarn раньше
+   выпадал из потока и утаскивал список результатов в auto-строку (20px). */
+.search-top { display: grid; grid-template-rows: auto auto; min-width: 0; }
+.sform { display: flex; gap: 6px; padding: 6px; }
+.sform .fld { flex: 1; font-size: 15px; padding: 6px 8px; }
+.tog {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  color: var(--palette-foreground); /* не dim: подпись чекбокса должна читаться */
+}
+.tog:hover { color: var(--palette-bright-foreground); }
+.result { padding: 5px 8px; border-bottom: 1px solid var(--row-border); }
+.result .r-head { display: flex; align-items: baseline; gap: 6px; }
+.result .scores { margin-left: auto; color: var(--dim-fg); font-size: 10.5px; white-space: nowrap; }
+.vecwarn { color: var(--dim-fg); padding: 0 8px 2px; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result .r-title { font-weight: bold; }
+.result .snippet { margin: 2px 0; color: var(--palette-foreground); word-break: break-word; }
+.result .snippet b { color: var(--palette-bright-foreground); background: var(--palette-selection); }
+.result .r-ref { font-size: 10.5px; }
+
+/* ---------- панель «источники» ---------- */
+.src-panel { grid-template-rows: auto minmax(0, 1fr) minmax(0, 30%); }
+.synclog { margin: 0 8px 8px; padding: 4px 8px; overflow: auto; font-size: 11.5px; }
+.synclog div { white-space: pre-wrap; }
+.ok-dot { color: var(--ok-fg); }
+.err-dot { color: var(--palette-red); }
+
+/* ---------- панель «настройки» ---------- */
+.set-sec { padding: 8px 10px 2px; }
+.set-sec h4 {
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--dim-fg);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.setrow { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+.setrow > label { flex: 1; min-width: 0; }
+.setrow .fld { width: 90px; flex: none; }
+.setwins { display: flex; flex-direction: column; gap: 2px; }
+.setwin { display: flex; align-items: center; gap: 10px; padding: 2px 0; }
+.setwin .st { font-size: 11px; white-space: nowrap; }
+
+/* встроенный экран настроек (⚙ в тулбаре): absolute-слой поверх панели, её DOM и
+   состояние не трогаются — закрытие просто снимает слой. */
+.setview {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 6px;
+  padding: 8px;
+  background: var(--palette-background);
+}
+.setview > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  background: var(--palette-lighter-background);
+  border: 1px solid;
+  border-color: var(--bevel-hi) var(--bevel-lo) var(--bevel-lo) var(--bevel-hi);
+}
+.setview > header .ttl { font-weight: bold; }
+.setview > header .spacer { flex: 1; }
+.setview .set-scroll { overflow: auto; min-height: 0; }
+.setview .set-note { font-size: 11px; color: var(--dim-fg); padding: 0 10px 4px; }
+.ovr-badge {
+  font-size: 10px;
+  padding: 0 4px;
+  margin-left: 6px;
+  color: var(--palette-yellow);
+  border: 1px solid var(--palette-yellow);
+}
+.setrow .reset { flex: none; }
+.setrow .effv { color: var(--dim-fg); font-size: 11px; }
+
+/* ---------- модальные диалоги («+ дело» и read-only «откуда?») ---------- */
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--palette-darker-background) 60%, transparent);
+  z-index: 100;
+}
+.dlg {
+  min-width: 300px;
+  max-width: 80vw;
+  padding: 10px;
+  background: var(--palette-lighter-background);
+}
+.dlg h3 { margin: 0 0 8px; font-size: 12.5px; font-weight: bold; }
+.dlg .drow { display: grid; gap: 2px; margin-bottom: 8px; }
+.dlg .drow label { font-size: 11px; color: var(--dim-fg); }
+.dlg .dbtns { display: flex; justify-content: flex-end; gap: 6px; margin-top: 4px; }
+/* происхождение связи: файл:строка — монографически, выделяется целиком */
+.dlg-ref {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  background: var(--well);
+  padding: 3px 6px;
+  margin: 4px 0;
+  user-select: all;
+  cursor: text;
+  word-break: break-all;
+  border: 1px solid;
+  border-color: var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo);
+}
+/* сырой фрагмент кода/конфига */
+.dlg-raw {
+  margin: 4px 0 0;
+  padding: 4px 6px;
+  font: 11px/1.5 var(--font-mono);
+  background: var(--well);
+  max-height: 30vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  border: 1px solid;
+  border-color: var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo);
+}
+/* ---------- список уведомлений (колокольчик → оверлей) ---------- */
+.nlist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 0 8px;
+  max-height: 50vh;
+  overflow: auto;
+  min-width: 340px;
+}
+.nrow {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 4px;
+  font-size: 11.5px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--row-border);
+}
+.nrow:hover { background: var(--hover-row); }
+.nrow.read { cursor: default; opacity: .55; }
+.nrow.read .ntext { text-decoration: line-through; }
+.ndot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dim-fg);
+  align-self: center;
+}
+.ndot-warn { background: var(--palette-yellow); }
+.ndot-err { background: var(--palette-red); }
+.nrow .chip { margin: 0; }
+.nts { flex: none; font-size: 10.5px; }
+.ntext { flex: 1; min-width: 0; word-break: break-word; }
+
+/* ---------- плотность на малых окнах (например 600×420) ---------- */
+@media (max-width: 700px) {
+  body { font-size: 11.5px; }
+  .tbl th, .tbl td { padding: 2px 5px; }
+  .path-cell { max-width: 140px; }
+  .quad-grid { grid-template-columns: 1fr 1fr; }
+  #chrome { gap: 6px; }
+}
+@media (max-height: 430px) {
+  .sform .fld { font-size: 13px; padding: 3px 6px; }
+  .synclog { font-size: 10.5px; }
+}
+
+/* =====================================================================
+   панель «herdr»: дерево workspace → tabs (пульт фокуса, без терминала)
+   =================================================================== */
+.htree { padding: 4px 6px; font-size: 12px; }
+.hrow {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 1px 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+.hrow:hover { background: var(--hover-row); }
+.hrow.focused { color: var(--palette-bright-foreground); }
+.hrow.pending { opacity: .55; }
+.hrow .hdot { flex: none; color: transparent; } /* точки нет — место держим, строки не прыгают */
+.hrow.focused .hdot { color: var(--palette-accent); }
+.hrow .hlabel { font-weight: bold; }
+.hrow.htab { padding-left: 24px; }
+.hrow.htab .hlabel { font-weight: normal; }
+.hrow .hmeta { color: var(--dim-fg); font-size: 10.5px; }
+.hrow .hmeta .ag-work { color: var(--palette-yellow); }
+.hrow .hmeta .ag-ok { color: var(--ok-fg); }
+
+/* =====================================================================
+   панель «Просмотр»: iframe локального веб-UI (allowlist — localhost/127.0.0.1)
+   =================================================================== */
+/* три строки: тулбар / адресная строка с ошибкой / область iframe.
+   Раньше в шаблоне было пять строк, а скрытые (#view-err, .errbox) выпадали из
+   потока — iframe попадал в auto-строку и брал интринсик 150px (панель «сжата»).
+   Теперь заполняющий элемент — ровно третья fr-строка, а iframe абсолютен. */
+.view-panel { grid-template-rows: auto auto minmax(0, 1fr); }
+.view-top { display: grid; grid-template-rows: auto auto; min-width: 0; }
+.view-bar { display: flex; align-items: center; gap: 6px; padding: 6px; }
+.view-bar .fld { flex: 1; min-width: 0; }
+.view-err { color: var(--palette-red); padding: 0 8px 4px; font-size: 11px; }
+.view-err.hidden { display: none; }
+/* iframe пустого «Просмотра» — это about:blank, а он бел; поэтому поверх него
+   лежит тёмная подсказка, пока адрес не задан (иначе панель выглядела бы «белой») */
+.view-holder { position: relative; min-height: 0; min-width: 0; padding: 0; }
+.view-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  padding: 10px;
+  font-size: 12px;
+  color: var(--dim-fg);
+  background: var(--palette-darker-background);
+}
+.view-empty.hidden { display: none !important; }
+.view-frame {
+  position: absolute; /* всегда заполняет .view-holder — без зависимости от 100%-высоты */
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+  background: var(--palette-darker-background);
+}
+
+/* =====================================================================
+   «задачи make» — сворачиваемый ящик под гридом проектов
+   =================================================================== */
+details.tasks { margin: 6px 0 0; }
+details.tasks > summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+  padding: 3px 8px;
+  color: var(--dim-fg);
+}
+details.tasks > summary:hover { color: var(--palette-bright-foreground); }
+.tasks-body { padding: 4px 8px 6px; }
+.mtasks-list { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 5px; }
+.mtask { font: inherit; font-size: 11px; padding: 1px 6px; cursor: pointer; }
+.mtask.sel { border-color: var(--palette-accent); color: var(--palette-bright-foreground); }
+.tasks-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 11.5px; }
+.tasks-bar .spin { color: var(--palette-yellow); }
+.tasks-out {
+  font: 11px/1.45 var(--font-mono);
+  background: var(--well);
+  border: 1px solid;
+  border-color: var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo);
+  padding: 4px 6px;
+  max-height: 190px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+.tasks-out .exit { display: block; margin-top: 2px; }
+.tasks-out .exit.ok { color: var(--ok-fg); }
+.tasks-out .exit.err { color: var(--palette-red); }
+
+/* =====================================================================
+   панель «Терминал»: один xterm.js на всю панель + оверлеи состояний
+   =================================================================== */
+.term-panel { grid-template-rows: auto minmax(0, 1fr) auto; padding: 0; gap: 0; }
+/* полоса сессий над терминалом: чип на сессию (оркестратор + proj-*), активный — акцент */
+.term-strip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding: 4px 6px 2px;
+  min-width: 0;
+}
+.term-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 1px 4px 1px 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  color: var(--dim-fg);
+  border: 1px solid var(--bevel-mid);
+  background: color-mix(in srgb, var(--palette-lighter-background) 60%, transparent);
+}
+.term-chip:hover { border-color: var(--palette-accent); color: var(--palette-bright-foreground); }
+.term-chip.active {
+  color: var(--palette-bright-foreground);
+  border-color: var(--palette-accent);
+  background: var(--palette-selection);
+}
+.term-chip .tdot { flex: none; color: var(--dim-fg); }
+.term-chip.alive .tdot { color: var(--ok-fg); }
+.term-chip.dead .tdot { color: var(--palette-red); }
+.term-chip .tx { flex: none; padding: 0 2px; color: var(--dim-fg); }
+.term-chip .tx:hover { color: var(--palette-red); }
+.term-add {
+  font-size: 11px;
+  padding: 1px 7px;
+  cursor: pointer;
+  border: 1px dashed var(--bevel-mid);
+  background: transparent;
+  color: var(--dim-fg);
+}
+.term-add:hover { border-color: var(--palette-accent); color: var(--palette-bright-foreground); }
+.term-hint { color: var(--dim-fg); font-size: 10.5px; }
+.term-wrap { position: relative; min-height: 0; min-width: 0; padding: 4px; }
+/* контейнер ОДНОЙ сессии: прячется display:none при переключении чипа —
+   xterm внутри продолжает принимать записи, буфер живёт, DOM сохранён */
+.term-host { position: absolute; inset: 4px; }
+.term-host.hidden { display: none !important; }
+.term-term { width: 100%; height: 100%; }
+.term-host .xterm { height: 100%; }
+.term-host .xterm-viewport { background: transparent !important; }
+/* оверлей сессии (exited/busy/error) поверх своего хоста; #term-overlay —
+   общий «нет сессий» на всю обёртку */
+.term-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  padding: 10px;
+  font-size: 12px;
+  background: color-mix(in srgb, var(--palette-darker-background) 74%, transparent);
+}
+#term-overlay { inset: 4px; }
+.term-overlay.hidden { display: none !important; }
+.term-overlay .btn95 { margin-left: 6px; }
+
+/* ---------- голосовой ввод (STT): кнопка-микрофон и запись ---------- */
+.stt-btn.rec {
+  color: var(--palette-red);
+  border-color: var(--palette-red);
+  animation: stt-pulse 1.2s ease-in-out infinite;
+}
+.stt-btn:disabled { color: var(--dim-fg); cursor: default; }
+@keyframes stt-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .stt-btn.rec { animation: none; } }
+/* подсказка про push-to-talk — ПЛАВАЮЩАЯ над строкой ввода: display-переключение
+   не должно двигать раскладку (иначе строка ввода прыгает под курсором) */
+.stt-hint {
+  position: absolute;
+  left: 12px;
+  bottom: 64px;
+  z-index: 6;
+  font-size: 10.5px;
+  padding: 1px 6px;
+  background: var(--palette-lighter-background);
+  border: 1px solid var(--bevel-mid);
+  box-shadow: 2px 2px 0 color-mix(in srgb, var(--palette-darker-background) 70%, transparent);
+}
+.stt-hint.hidden { display: none !important; }
+
+/* ---------- контекстное меню (ПКМ): тот же вид, что попап mkSelect ---------- */
+.ctxmenu { display: flex; min-width: 210px; max-width: 74vw; outline: none; }
+.ctxmenu-list { display: flex; flex-direction: column; min-width: 100%; }
+.ctxmenu-item {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 3px 8px;
+  font-size: 11.5px;
+  white-space: nowrap;
+  cursor: pointer;
+  color: var(--palette-bright-foreground);
+}
+.ctxmenu-item.active { background: var(--palette-selection); }
+.ctxmenu-item.danger { color: var(--palette-red); }
+.ctxmenu-item.disabled { color: var(--dim-fg); cursor: default; opacity: .6; }
+.ctxmenu-hint { margin-left: auto; padding-left: 16px; color: var(--dim-fg); font-size: 10.5px; }
+.ctxmenu-sep { height: 0; margin: 2px 4px; border-top: 1px solid var(--bevel-mid); }
+
+/* =====================================================================
+   поиск: кнопка «↗ файл» в конце строки результата (только для file-хитов)
+   =================================================================== */
+.r-file { flex: none; font-size: 10.5px; margin-left: 6px; }
+
+/* =====================================================================
+   панель «Оркестратор»: чат поверх rpc-канала (сообщения / карточки
+   подтверждений / ввод). Три строки грида: список (fr), карточки (auto),
+   ввод (auto) — скрытые карточки не съедают место списка.
+   =================================================================== */
+.orch-panel { grid-template-rows: auto minmax(0, 1fr) auto auto; }
+.orch-chat { position: relative; padding: 8px 10px; }
+.orch-list { display: flex; flex-direction: column; gap: 6px; }
+.orch-msg { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.orch-msg .orch-who { font-size: 10.5px; color: var(--dim-fg); }
+.orch-bubble {
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  padding: 3px 7px;
+  max-width: 88%;
+  border: 1px solid var(--bevel-mid);
+}
+.orch-user { align-items: flex-end; }
+.orch-user .orch-who { color: var(--palette-accent); }
+.orch-user .orch-bubble { background: var(--palette-selection); color: var(--palette-bright-foreground); }
+.orch-asst { align-items: flex-start; }
+.orch-asst .orch-bubble { background: var(--palette-lighter-background); }
+.orch-think { font-size: 11px; cursor: pointer; user-select: none; }
+.orch-think::before { content: "· "; }
+.orch-think.open::before { content: "⌄ "; }
+.orch-think-body {
+  margin: 0;
+  font: 11px/1.45 var(--font-mono);
+  color: var(--dim-fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  border-left: 2px solid var(--bevel-mid);
+  padding-left: 6px;
+  max-height: 26vh;
+  overflow: auto;
+}
+.orch-tool { font-size: 11px; }
+.orch-tool-detail { color: var(--dim-fg); }
+.orch-tool-mark { color: var(--palette-accent); }
+.orch-tool[data-state="end"] .orch-tool-mark { color: var(--ok-fg); }
+.orch-tool-err .orch-tool-mark { color: var(--palette-red); }
+.orch-err { color: var(--palette-red); white-space: pre-wrap; word-break: break-word; }
+.orch-done { font-size: 11px; }
+.orch-notice { font-size: 11px; }
+.orch-new {
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  z-index: 3;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+  color: var(--palette-bright-foreground);
+  background: var(--palette-selection);
+  border: 1px solid var(--palette-accent);
+}
+.orch-new.hidden { display: none !important; }
+.orch-approvals {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 2px;
+  max-height: 42vh;
+  overflow: auto;
+}
+.orch-approvals.hidden { display: none !important; }
+.orch-approval {
+  padding: 5px 8px;
+  background: color-mix(in srgb, var(--palette-yellow) 14%, var(--palette-lighter-background));
+  border: 1px solid var(--palette-yellow);
+}
+.orch-approval-head { display: flex; align-items: baseline; gap: 8px; }
+.orch-approval-head .spacer { flex: 1; }
+.orch-approval-tool { font-weight: bold; }
+.orch-approval-timer { font-size: 11px; color: var(--palette-yellow); }
+.orch-approval-detail {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--palette-foreground);
+  background: var(--well);
+  padding: 3px 6px;
+  margin: 4px 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  max-height: 18vh;
+  overflow: auto;
+}
+.orch-approval-btns { display: flex; gap: 6px; }
+.orch-approval.resolved {
+  opacity: .6;
+  border-color: var(--bevel-mid);
+  background: color-mix(in srgb, var(--palette-lighter-background) 60%, transparent);
+}
+.orch-approval.resolved .orch-approval-timer { color: var(--dim-fg); }
+.orch-approval-mark { font-weight: bold; }
+.orch-approval-mark.ok { color: var(--ok-fg); }
+.orch-approval-mark.err { color: var(--palette-red); }
+.orch-input { display: flex; align-items: flex-end; gap: 6px; }
+.orch-text {
+  flex: 1;
+  min-width: 0;
+  min-height: 34px;
+  max-height: 30vh;
+  resize: vertical;
+  font: inherit;
+  color: var(--palette-foreground);
+  background: var(--well);
+  padding: 4px 6px;
+  border: 1px solid;
+  border-color: var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo);
+  box-shadow: inset 1px 1px 0 var(--bevel-lo);
+}
+.orch-text::placeholder { color: var(--dim-fg); }
+.orch-text:focus { outline: 1px dotted var(--palette-accent); outline-offset: -3px; }
+.orch-text:disabled { color: var(--dim-fg); cursor: default; }
+#chrome .orch-st { font-size: 11px; white-space: nowrap; }
+#chrome .orch-st.work { color: var(--palette-yellow); }
+#chrome .orch-st.ok { color: var(--ok-fg); }
+#chrome .orch-st.dim { color: var(--dim-fg); }
+
+/* подсказка к строке настроек (например patrol.interval_min) */
+.set-hint { font-size: 10.5px; max-width: 40%; white-space: normal; }
+
+/* ---------- полировка доски и ревью: микропереходы, статусы, diff ---------- */
+/* принцип тот же, что у всей панели: фаски и палитра omarchy, никакой чужой
+   лоскутности — только скорость отклика и читаемость. */
+
+/* карточки: отклик на наведение мягкий, без рывков */
+.card { transition: border-color .12s ease, background-color .12s ease; }
+.card:not(.card-done):hover {
+  border-color: color-mix(in srgb, var(--palette-accent) 45%, var(--bevel-hi));
+  background: color-mix(in srgb, var(--palette-accent) 5%, var(--palette-lighter-background));
+}
+.card:focus-visible { outline: 1px solid var(--palette-accent); outline-offset: 1px; }
+
+/* кнопки: фон меняется без щелчка кадра */
+.btn95, .mini { transition: background-color .1s ease; }
+
+/* статусы делегации: живой прогон «дышит», вопросы — между жёлтым и красным */
+@keyframes deleg-breathe { 50% { opacity: .55; } }
+.chip.deleg-running { animation: deleg-breathe 2s ease-in-out infinite; }
+.chip.deleg-feedback {
+  color: color-mix(in srgb, var(--palette-red) 55%, var(--palette-yellow));
+  border-color: color-mix(in srgb, var(--palette-red) 55%, var(--palette-yellow));
+}
+/* ревьюер думает — та же дыхательная подсказка в ревью-модалке */
+.deleg-review-wait { animation: deleg-breathe 1.6s ease-in-out infinite; }
+
+/* пустой квадрант: не голое «пусто», а обозначенное место */
+.quad .cards > .dim {
+  padding: 8px 6px;
+  text-align: center;
+  border: 1px dashed var(--bevel-mid);
+  color: var(--dim-fg);
+}
+
+/* diff ревью: структура читается цветом — файлы акцентом, ханки жёлтым,
+   строки — лёгким тинтом фона, чтобы глаз цеплял полосы, а не буквы */
+.deleg-diff .dl-file { color: var(--palette-accent); }
+.deleg-diff .dl-hunk { color: var(--palette-yellow); }
+.deleg-diff .dl-add { background: color-mix(in srgb, var(--ok-fg) 11%, transparent); }
+.deleg-diff .dl-del { background: color-mix(in srgb, var(--palette-red) 11%, transparent); }
+
+/* диалоги: короткое появление вместо мгновенного щелчка */
+@keyframes dlg-in { from { opacity: 0; transform: translateY(4px) scale(.985); } }
+@keyframes dlg-fade { from { opacity: 0; } }
+.dlg { animation: dlg-in .12s ease-out; }
+.overlay { animation: dlg-fade .12s ease-out; }
+
+/* движение — только для тех, кто его просил */
+@media (prefers-reduced-motion: reduce) {
+  .dlg, .overlay { animation: none; }
+  .chip.deleg-running, .deleg-review-wait { animation: none; }
+  .card, .btn95, .mini { transition: none; }
+}
+
+/* верификация гейта на карточке ревью */
+.gate-ok { color: var(--ok-fg); }
+.gate-fail { color: var(--palette-red); }

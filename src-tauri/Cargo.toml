@@ -1,0 +1,50 @@
+[package]
+name = "atlas"
+version = "0.1.0"
+edition = "2021"
+description = "atlas desktop shell + control-plane server"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+# Single-instance: the FIRST plugin initialised. A second GUI launch must not
+# create windows and must not linger — the plugin forwards to the primary and
+# exits the second process (the callback then just raises the primary window).
+tauri-plugin-single-instance = "2"
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+portable-pty = "0.9"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+rust-embed = "8"
+async-stream = "0.3"
+regex = "1"
+log = "0.4"
+sha2 = "0.10"
+# Sync locks in new code are parking_lot per project rule (direct guards, no
+# poison boilerplate); already in the tree transitively.
+parking_lot = "0.12"
+# Optional ~/.config/atlas/config.toml (see cfg.rs and README «Конфигурация»);
+# the 0.8 line is already in Cargo.lock transitively, so offline builds do not
+# fetch anything new.
+toml = "0.8"
+# Local ONNX embeddings (multilingual-e5-base); rustls-only features keep the
+# build lean — image models and native-tls are not needed.
+fastembed = { version = "7", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
+
+# `tower::ServiceExt::oneshot` drives the real router in tests (same tower
+# version axum already uses), so the HTTP contract is asserted end to end.
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+# `#[tokio::test(start_paused = true)]` drives the wait-loop/watchdog tests
+# over tokio's injected (paused) clock — the full 2 s/60 s budgets elapse
+# virtually, instantly and deterministically.
+tokio = { version = "1", features = ["test-util"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

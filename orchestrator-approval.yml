@@ -1,0 +1,500 @@
+# atlas orchestrator — approval policy (one-shot omp config overlay)
+#
+# WHO READS IT
+#   The persistent rpc child of the «Оркестратор» panel is spawned by
+#   `src-tauri/src/orch.rs` (`spawn_argv`) as
+#       omp --mode rpc --config <atlas_dir>/orchestrator-approval.yml
+#           --session <data_dir>/atlas-orchestrator.jsonl --cwd <atlas_dir>
+#           --append-system-prompt <atlas_dir>/orchestrator.md
+#   `--config` overlays are loaded after the global `~/.omp/agent/config.yml`
+#   and the project config, and before runtime flags — so THIS FILE is the
+#   single source of truth for the orchestrator's approval behaviour, and it
+#   can be edited live: an RPC host re-reads config overlays on change
+#   (omp://settings.md, «Live file changes»).
+#
+# WHY IT EXISTS
+#   The orchestrator used to run `--approval-mode always-ask`, which raised an
+#   approval card for EVERY tool call — including `echo hi`. The user's
+#   complaint: «оркестратор постоянно спрашивает разрешение на выполнение
+#   команд, даже тех которые не ломают».
+#   `--approval-mode write` is NOT the fix: `write` auto-approves the `read`
+#   and `write` tiers and still prompts for `exec`, and every command runs
+#   through the `bash` tool, which is `exec` tier (omp://approval-mode.md, the
+#   mode table). So "free except risky" cannot be expressed by the mode alone.
+#   The mechanism that can is: mode `yolo` (nothing prompts by tier) PLUS an
+#   explicit `bash.patterns` list whose `prompt` rules force a card for the
+#   destructive/outward-facing classes. An explicit tool/user `prompt` policy
+#   is still enforced under `yolo` (omp://approval-mode.md, «Resolution per
+#   tool call», step 3).
+#
+# HOW TO CHANGE IT
+#   * One more risky command class   → add a rule to the relevant block below.
+#   * Ask for everything again       → set `tools.approvalMode: always-ask`.
+#   * Ask for nothing at all         → `tools.approvalMode: yolo` + delete the
+#                                      `bash.patterns` list.
+#   * Deny instead of ask            → change a rule's `approval:` to `deny`.
+#   * Anything the bash tool itself calls CRITICAL (its built-in regexes:
+#     `rm -rf`/`rm -r`/`rm -f` against an ABSOLUTE path, `rm --no-preserve-root`,
+#     `sudo rm`, a shell asked for a command string (`sh -c`, `--command`),
+#     fork bombs, `> /dev/sd*`, `mkfs*`, `dd … of=/dev/*`, `shred /dev/*`,
+#     `cryptsetup`, `chmod -R … /`, `chown -R … /`) cannot be ASKED about at
+#     all under yolo — see «HONEST LIMITS». Those live in block 0 and MUST stay
+#     `deny`.
+#   Restart the child afterwards? No: overlay edits are picked up live. If a
+#   syntax error slips in, omp keeps the last good values and logs a warning
+#   — but a *missing* file is a hard error, so `spawn_argv` only passes
+#   `--config` when the file is present (see `cfg::orch_policy_args`).
+#
+# HONEST LIMITS
+#   * `bash.patterns` is an approval policy, NOT containment: an approved
+#     command keeps the shell's ambient filesystem, network and subprocess
+#     access, and any allowed program can do broader things through its own
+#     options (omp://tools/bash.md, «Command policy»). Patterns are text, so
+#     `find . -exec shred {} +`, a script that deletes things, or
+#     `mv x /etc/` are not caught by the text itself.
+#   * The yolo ⇄ critical trap (measured 09.10.2026 with an rpc probe against
+#     a child started on this very file: `rm -rf /tmp/x` ran with NO card while
+#     `rm -rf*` sat right below as a `prompt` rule):
+#     for a command the tool's built-in detector calls critical, the tool
+#     REPLACES the pattern engine's allow/prompt answer with a bare
+#     `{override:true}` safety override, and under yolo that bare override is
+#     IGNORED. `rm -rf /tmp/x` therefore ran with NO card even with a `rm -rf*`
+#     prompt rule right here. Only `deny` survives (it is absolute in every
+#     mode and is never replaced), which is why block 0 exists and why those
+#     classes are blocked outright instead of asked about.
+#   * Patterns are ANCHORED text with `*` wildcards: a rule without a leading
+#     `*` only matches a command that starts with it, so a prompt rule can be
+#     evaded by prefixing. `bash.allowCompoundCommands: true` closes that for
+#     flat `&&` chains of literal commands only — `cd x && git push`, `;` and
+#     `|` chains, subshells, redirections, globs, expansions and scripts stay
+#     evadable. Read this file as a guardrail that makes the common accidents
+#     visible, never as a sandbox.
+#   * The patterns govern the `bash` tool only. `eval` can spawn a shell and
+#     is NOT covered (omp://approval-mode.md, «Safety overrides»); it stays on
+#     the global `tools.approval.eval` value (`allow`), i.e. an `eval` call is
+#     an accepted way around every rule below.
+#   * A rule matches TEXT, not intent: `grep mkfs README.md`, or a commit message
+#     that merely names one of the guarded tools, is blocked as well. Measured
+#     09.10.2026: a `git commit -F -` whose message listed the synthetic-input
+#     tools was refused by the global input-guard pattern. Reword the command, or
+#     drop the rule if the false positive costs more than the class is worth — the
+#     block message always names the pattern that fired.
+#   * `deny` here is absolute (it also holds under `yolo`); `prompt` shows the
+#     usual approval card in the panel and is auto-denied after 5 minutes.
+#   * Subagents of the orchestrator run headless: a `prompt` rule they hit
+#     cannot be displayed, and such a call fails instead of running.
+
+tools:
+  # Benign tools run without asking. This is the key the whole file hangs on:
+  # it overrides the global/project mode for the orchestrator child only.
+  approvalMode: yolo
+
+  # `tools.approval.*` is deliberately NOT restated here: this overlay only
+  # touches `approvalMode`, `bash.allowCompoundCommands` and `bash.patterns`, so
+  # the global values apply unchanged (`computer: deny` stays a hard deny,
+  # `eval: allow` stays free).
+  # Do not add `tools.approval.bash` — a `prompt` there would ask for every
+  # single command again, which is exactly what this file exists to stop.
+
+bash:
+  # A chain is evaluated per segment. Measured 09.10.2026 on this file: `cd /tmp
+  # && rm -rf e6` raised the `rm -rf*` card and `x=1; sudo pacman -Syu` raised
+  # `sudo*` — so the split covers `&&` AND `;`, not just flat `&&` chains as the
+  # docs put it. NOT measured, and therefore not relied upon: `|`/`&` joins,
+  # subshells, expansions, and a script doing the work (`bash script.sh`) — those
+  # keep the legacy whole-string behaviour, where only a rule whose pattern
+  # matches from the start of the line hits. See «HONEST LIMITS» above.
+  allowCompoundCommands: true
+
+  # Ordered list, FIRST MATCH WINS. Matching is literal text with `*` wildcards
+  # (whitespace runs collapse to one space) and is ANCHORED: a rule without a
+  # leading `*` matches only text that starts the line (or a segment). Every
+  # block-0 deny therefore carries a leading `*`, so a critical class is caught
+  # even in the middle of a longer line (measured: a command wrapped as
+  # `stat …; rm -rf /tmp/x; stat …` was blocked by `*rm -rf /*`).
+  patterns:
+    # ---------------------------------------------------------------------
+    # 0. Critical-class denies — the classes the omp bash tool itself calls
+    #    critical (its built-in regexes decide this, not us). These MUST be
+    #    `deny`, never `prompt`:
+    #      * under yolo the tool's bare critical override is IGNORED, so the
+    #        call would run with no card;
+    #      * for a critical command the tool REPLACES a matching allow/prompt
+    #        return with that bare override, so a `prompt` rule can never gate
+    #        one — measured: `rm -rf /tmp/x` ran with no card with a `rm -rf*`
+    #        prompt rule in this very file (frames in /tmp/atlas-appr-probe-run).
+    #    `deny` is absolute in every mode and is NOT replaced by the override,
+    #    so it is the only reliable gate for these classes.
+    #    Cost, stated honestly: the orchestrator cannot run them at all — it
+    #    reports the block and the human runs the command. That is deliberate:
+    #    a silent `rm -rf /path` is the failure this whole file exists to stop.
+    # ---------------------------------------------------------------------
+    # recursive/forced delete of an ABSOLUTE path (relative targets stay free)
+    - match: "*rm -rf /*"
+      approval: deny
+    - match: "*rm -fr /*"
+      approval: deny
+    - match: "*rm -r /*"
+      approval: deny
+    - match: "*rm -R /*"
+      approval: deny
+    - match: "*rm --recursive /*"
+      approval: deny
+    - match: "*--no-preserve-root*"
+      approval: deny
+    # recursive chmod/chown of an ABSOLUTE path (relative stays a prompt below)
+    - match: "*chmod -R * /*"
+      approval: deny
+    - match: "*chown -R * /*"
+      approval: deny
+    # privilege escalation into a delete
+    - match: "*sudo rm*"
+      approval: deny
+    # a shell asked to run a string — the single biggest pattern-evasion path
+    - match: "*sh -c*"
+      approval: deny
+    - match: "*bash -c*"
+      approval: deny
+    - match: "*zsh -c*"
+      approval: deny
+    - match: "*sh --command*"
+      approval: deny
+    - match: "*bash --command*"
+      approval: deny
+    # fork bomb
+    - match: "*:(){*"
+      approval: deny
+    # raw block devices / filesystems
+    - match: "*> /dev/sd*"
+      approval: deny
+    - match: "*>/dev/sd*"
+      approval: deny
+    - match: "*dd *of=/dev/*"
+      approval: deny
+    - match: "*shred /dev/*"
+      approval: deny
+    - match: "*cryptsetup*"
+      approval: deny
+    - match: "*mkfs*"
+      approval: deny
+
+    # ---------------------------------------------------------------------
+    # 1. Guard denies — copied VERBATIM from ~/.omp/agent/config.yml.
+    #
+    # Arrays do not deep-merge in omp settings: a higher layer REPLACES the
+    # whole `bash.patterns` array (omp://settings.md, «Merge rules»). So this
+    # list, being an override, would otherwise SHADOW the guard's denies for
+    # the orchestrator. They are therefore repeated here, first, so they win
+    # over every prompt rule below. Keep them in sync with the global config.
+    # (`hyprctl clients -j` and friends stay free: read-only.)
+    # ---------------------------------------------------------------------
+    - match: "*wtype *"
+      approval: deny
+    - match: "wtype"
+      approval: deny
+    - match: "*ydotool *"
+      approval: deny
+    - match: "ydotool"
+      approval: deny
+    - match: "*dotool *"
+      approval: deny
+    - match: "dotool"
+      approval: deny
+    - match: "*wlrctl *"
+      approval: deny
+    - match: "wlrctl"
+      approval: deny
+    - match: "*xdotool *"
+      approval: deny
+    - match: "xdotool"
+      approval: deny
+    - match: "*hyprctl eval*"
+      approval: deny
+    - match: "*hyprctl dispatch*"
+      approval: deny
+    - match: "*hyprctl keyword*"
+      approval: deny
+    - match: "*hyprctl --batch*"
+      approval: deny
+
+    # ---------------------------------------------------------------------
+    # 2. Recursive / forced deletion.
+    #    `rm -f <file>` and plain `rm <file>` stay free: they are routine
+    #    cleanup of one explicit path. The recursion/force-with-recursion
+    #    forms are the ones that end in tears. `find` can delete in bulk
+    #    without ever looking like `rm`.
+    #    NOTE the split: absolute-path recursion is DENIED in block 0 (critical
+    #    class — a prompt could never fire there), so the prompt rules below
+    #    cover what is left, relative targets like `rm -rf build`.
+    # ---------------------------------------------------------------------
+    - match: "rm -rf*"
+      approval: prompt
+    - match: "rm -fr*"
+      approval: prompt
+    - match: "rm -r*"
+      approval: prompt
+    - match: "rm -R*"
+      approval: prompt
+    - match: "rm --recursive*"
+      approval: prompt
+    - match: "shred*"
+      approval: prompt
+    - match: "find *-delete*"
+      approval: prompt
+    - match: "find *-exec rm*"
+      approval: prompt
+
+    # ---------------------------------------------------------------------
+    # 3. Disks, partitions, mounts — irreversible when aimed wrong.
+    #    `mkfs*`, `cryptsetup`, `dd … of=/dev/*`, `shred /dev/*` and raw
+    #    `> /dev/sd*` writes are DENIED in block 0 (critical class); the rules
+    #    below are the remaining, answerable ones.
+    # ---------------------------------------------------------------------
+    - match: "dd*"
+      approval: prompt
+    - match: "mkfs*"
+      approval: prompt
+    - match: "fdisk*"
+      approval: prompt
+    - match: "sfdisk*"
+      approval: prompt
+    - match: "parted*"
+      approval: prompt
+    - match: "blkdiscard*"
+      approval: prompt
+    - match: "wipefs*"
+      approval: prompt
+    - match: "mount*"
+      approval: prompt
+    - match: "umount*"
+      approval: prompt
+
+    # ---------------------------------------------------------------------
+    # 4. Privilege escalation — everything after `sudo` is unaudited.
+    # ---------------------------------------------------------------------
+    - match: "sudo*"
+      approval: prompt
+    - match: "doas*"
+      approval: prompt
+    - match: "pkexec*"
+      approval: prompt
+
+    # ---------------------------------------------------------------------
+    # 5. Package managers — network + system mutation. Queries (`pacman -Q`,
+    #    `yay -Ss`) stay free; installing, upgrading and removing do not.
+    # ---------------------------------------------------------------------
+    - match: "pacman -S*"
+      approval: prompt
+    - match: "pacman -R*"
+      approval: prompt
+    - match: "pacman -U*"
+      approval: prompt
+    - match: "pacman -D*"
+      approval: prompt
+    - match: "pacman -F*"
+      approval: prompt
+    - match: "yay -S*"
+      approval: prompt
+    - match: "yay -R*"
+      approval: prompt
+    - match: "paru -S*"
+      approval: prompt
+    - match: "paru -R*"
+      approval: prompt
+    - match: "apt*"
+      approval: prompt
+    - match: "dnf*"
+      approval: prompt
+    - match: "snap install*"
+      approval: prompt
+    - match: "flatpak install*"
+      approval: prompt
+    - match: "npm *-g*"
+      approval: prompt
+    - match: "npm *--global*"
+      approval: prompt
+    - match: "pnpm *-g*"
+      approval: prompt
+    - match: "bun *-g*"
+      approval: prompt
+    - match: "pip install*"
+      approval: prompt
+    - match: "pip3 install*"
+      approval: prompt
+    - match: "pipx install*"
+      approval: prompt
+    - match: "cargo install*"
+      approval: prompt
+
+    # ---------------------------------------------------------------------
+    # 6. Services and the session/system power state. The `systemctl` rules
+    #    are written `systemctl *<verb>*` so `--user`/`--now`/unit forms all
+    #    match; plain `systemctl status|list-units|cat` stays free.
+    # ---------------------------------------------------------------------
+    - match: "systemctl *start*"
+      approval: prompt
+    - match: "systemctl *stop*"
+      approval: prompt
+    - match: "systemctl *enable*"
+      approval: prompt
+    - match: "systemctl *disable*"
+      approval: prompt
+    - match: "systemctl *mask*"
+      approval: prompt
+    - match: "systemctl *daemon-reload*"
+      approval: prompt
+    - match: "systemctl *poweroff*"
+      approval: prompt
+    - match: "systemctl *reboot*"
+      approval: prompt
+    - match: "loginctl *terminate*"
+      approval: prompt
+    - match: "loginctl *kill*"
+      approval: prompt
+    - match: "loginctl *poweroff*"
+      approval: prompt
+    - match: "loginctl *reboot*"
+      approval: prompt
+    - match: "pkill*"
+      approval: prompt
+    - match: "killall*"
+      approval: prompt
+    - match: "kill -9*"
+      approval: prompt
+    - match: "kill -KILL*"
+      approval: prompt
+    - match: "kill -s 9*"
+      approval: prompt
+    - match: "reboot*"
+      approval: prompt
+    - match: "poweroff*"
+      approval: prompt
+    - match: "halt*"
+      approval: prompt
+    - match: "shutdown*"
+      approval: prompt
+
+    # ---------------------------------------------------------------------
+    # 7. Git history and remote mutations. Reading, staging, committing,
+    #    branching and merging stay free (`git push` is the only way the
+    #    orchestrator publishes anything, so it always asks).
+    # ---------------------------------------------------------------------
+    - match: "git push*"
+      approval: prompt
+    - match: "git reset --hard*"
+      approval: prompt
+    - match: "git clean -f*"
+      approval: prompt
+    - match: "git clean -d*"
+      approval: prompt
+    - match: "git clean -x*"
+      approval: prompt
+    - match: "git rebase*"
+      approval: prompt
+    - match: "git branch -D*"
+      approval: prompt
+    - match: "git tag -d*"
+      approval: prompt
+    - match: "git filter-branch*"
+      approval: prompt
+    - match: "git filter-repo*"
+      approval: prompt
+    - match: "git remote add*"
+      approval: prompt
+    - match: "git remote set-url*"
+      approval: prompt
+    - match: "git checkout -- *"
+      approval: prompt
+    - match: "git restore *"
+      approval: prompt
+
+    # ---------------------------------------------------------------------
+    # 8. Recursive permission/ownership changes.
+    # ---------------------------------------------------------------------
+    - match: "chmod -R*"
+      approval: prompt
+    - match: "chmod --recursive*"
+      approval: prompt
+    - match: "chown -R*"
+      approval: prompt
+    - match: "chown --recursive*"
+      approval: prompt
+
+    # ---------------------------------------------------------------------
+    # 9. Writes outside the home/project trees: redirections and `tee` into
+    #    system directories, plus raw block devices. Both `> /etc/x` and
+    #    `>/etc/x` spellings are listed; `>>` is caught by the `>` rule.
+    #    `> /dev/null` is untouched (it matches none of these paths).
+    # ---------------------------------------------------------------------
+    - match: "* > /etc/*"
+      approval: prompt
+    - match: "*>/etc/*"
+      approval: prompt
+    - match: "* > /usr/*"
+      approval: prompt
+    - match: "*>/usr/*"
+      approval: prompt
+    - match: "* > /boot/*"
+      approval: prompt
+    - match: "*>/boot/*"
+      approval: prompt
+    - match: "tee /etc/*"
+      approval: prompt
+    - match: "tee /usr/*"
+      approval: prompt
+    - match: "tee /boot/*"
+      approval: prompt
+    - match: "* > /dev/sd*"
+      approval: prompt
+    - match: "*>/dev/sd*"
+      approval: prompt
+    - match: "* > /dev/nvme*"
+      approval: prompt
+    - match: "*>/dev/nvme*"
+      approval: prompt
+    - match: "* > /dev/mmcblk*"
+      approval: prompt
+    - match: "*>/dev/mmcblk*"
+      approval: prompt
+    - match: "* > /dev/disk/*"
+      approval: prompt
+    - match: "*>/dev/disk/*"
+      approval: prompt
+
+    # ---------------------------------------------------------------------
+    # 10. Remote-fetch-then-execute pipelines — the payload is never read by
+    #     anyone. `| sh`/`| bash`/`| python`/`| node` cover the usual forms.
+    # ---------------------------------------------------------------------
+    - match: "*| sh*"
+      approval: prompt
+    - match: "*|sh*"
+      approval: prompt
+    - match: "*| bash*"
+      approval: prompt
+    - match: "*|bash*"
+      approval: prompt
+    - match: "*| python*"
+      approval: prompt
+    - match: "*|python*"
+      approval: prompt
+    - match: "*| node*"
+      approval: prompt
+    - match: "*|node*"
+      approval: prompt
+
+    # ---------------------------------------------------------------------
+    # 11. Other machines and bulk overwrite: reaching a remote host, and
+    #     force-move / delete-mirror syncs.
+    # ---------------------------------------------------------------------
+    - match: "ssh *"
+      approval: prompt
+    - match: "scp *"
+      approval: prompt
+    - match: "rsync *--delete*"
+      approval: prompt
+    - match: "rsync *@*"
+      approval: prompt
+    - match: "mv -f*"
+      approval: prompt
+    - match: "mv --force*"
+      approval: prompt
