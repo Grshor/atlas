@@ -781,14 +781,45 @@ fn run_session_path(item_id: i64, _title: &str, run_id: i64) -> PathBuf {
     runs_dir(item_id, run_id).join("session.jsonl")
 }
 
+/// Poll `f` every `interval` up to `attempts` times; first `Some` wins. Pure
+/// via the injected `sleep` — the resolver's thread loop is a thin wrapper.
+fn poll_until<T>(
+    attempts: u32,
+    interval: Duration,
+    mut sleep: impl FnMut(Duration),
+    mut f: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    for i in 0..attempts {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        if i + 1 < attempts {
+            sleep(interval);
+        }
+    }
+    None
+}
+
+/// Resolver pacing: omp in rpc mode mints the session file lazily (first
+/// flush ≈ first-turn latency, seconds), so a fixed 3 s peek lost the race on
+/// every run and the follow-up silently started fresh. Poll instead: every
+/// 500 ms for up to 30 s.
+const RESOLVER_POLL_ATTEMPTS: u32 = 60;
+const RESOLVER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Pin the session file omp actually created for a FRESH spawn into
-/// `delegation_session` (guarded by run_id): a detached one-shot thread a
-/// couple of seconds after the spawn. Without this, the next follow-up would
-/// try to resume a placeholder path omp never wrote.
+/// `delegation_session` (guarded by run_id): a detached thread polling the
+/// run's dossier dir. Without this, the next follow-up would try to resume a
+/// placeholder path omp never wrote.
 fn spawn_session_resolver(item_id: i64, run_id: i64, dir: PathBuf, started: std::time::SystemTime) {
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(3));
-        match omp_rpc::resolve_fresh_session(&dir, started) {
+        let found = poll_until(
+            RESOLVER_POLL_ATTEMPTS,
+            RESOLVER_POLL_INTERVAL,
+            std::thread::sleep,
+            || omp_rpc::resolve_fresh_session(&dir, started),
+        );
+        match found {
             Some(p) => {
                 let conn = db::db_static().lock();
                 if let Err(e) = conn.execute(
@@ -800,8 +831,9 @@ fn spawn_session_resolver(item_id: i64, run_id: i64, dir: PathBuf, started: std:
                 }
             }
             None => log::warn!(
-                "delegate: item {item_id}: свежая сессия не найдена в {} — follow-up начнёт новую",
-                dir.display()
+                "delegate: item {item_id}: свежая сессия не найдена в {} за {} с — follow-up начнёт новую",
+                dir.display(),
+                RESOLVER_POLL_ATTEMPTS as u64 * RESOLVER_POLL_INTERVAL.as_millis() as u64 / 1000,
             ),
         }
     });
@@ -914,6 +946,47 @@ fn write_jsonl_line(out: &mut impl std::io::Write, line: &str) -> Result<(), Str
     out.write_all(b"\n").map_err(|e| e.to_string())
 }
 
+/// omp's title slot is a FIXED-WIDTH record: the first line of a session file
+/// is the `title` JSON padded with a trailing `"pad"` of spaces to exactly 256
+/// bytes (payload + `\n`). omp's scanner strips the slot only at this exact
+/// width; any other width leaves the title line in the entry stream, the first
+/// entry is not a `session` record, and the resume dies with «the session
+/// header is missing or malformed» (the bug that killed item 13's resume on
+/// the omp 18.10.3 upgrade). Measured byte-for-byte against omp-minted
+/// sessions; the width is bytes, not chars.
+const TITLE_SLOT_BYTES: usize = 256;
+
+/// The fork's lineage title line, padded to omp's canonical slot width
+/// (`…,"pad":"<spaces>"}` + `\n` = [`TITLE_SLOT_BYTES`] bytes). A title too
+/// long for the slot is truncated char-wise until it fits — omp throws on an
+/// overlong slot, which would abort the whole fork.
+fn title_slot_line(title: &str, updated_at: &str) -> String {
+    let mut title = title.to_string();
+    loop {
+        let base = json!({
+            "type": "title", "v": 1, "title": title, "source": "auto", "updatedAt": updated_at,
+        })
+        .to_string();
+        // base minus its closing brace, then `,"pad":"`, spaces, `"}`, `\n`
+        let fixed = base.len() - 1 + 8 + 2 + 1; // 8 = `,"pad":"`, 2 = `"}`, 1 = `\n`
+        if fixed <= TITLE_SLOT_BYTES {
+            let pad = TITLE_SLOT_BYTES - fixed;
+            let mut line = base;
+            line.pop(); // the closing brace
+            line.push_str(",\"pad\":\"");
+            line.push_str(&" ".repeat(pad));
+            line.push_str("\"}");
+            debug_assert_eq!(line.len() + 1, TITLE_SLOT_BYTES);
+            return line;
+        }
+        // doesn't fit — drop chars off the title and retry (UTF-8 safe)
+        match title.char_indices().nth_back(1) {
+            Some((i, _)) => title.truncate(i),
+            None => unreachable!("updatedAt alone always fits the slot"),
+        }
+    }
+}
+
 /// Copy the project session into the run's dossier dir under a NEW session id
 /// — micelium's `seededFork` (fork.go), tip variant: a FULL copy, no
 /// truncation. Lines 1/2 are rewritten the way omp itself writes a lineage: a
@@ -943,10 +1016,7 @@ fn fork_session_file(src: &Path, old: &SessionHead, dest_dir: &Path) -> Result<P
         format!("Fork: {}", old.title)
     };
     let now = cfg::util::now_iso_utc();
-    let title_line = json!({
-        "type": "title", "v": 1, "title": fork_title, "source": "auto", "updatedAt": now,
-    })
-    .to_string();
+    let title_line = title_slot_line(&fork_title, &now);
     let session_line = json!({
         "type": "session", "version": 3, "id": new_id, "timestamp": now,
         "cwd": old.cwd, "title": fork_title,
@@ -3500,6 +3570,58 @@ mod tests {
         assert_eq!(a, run_session_path(7, "дело", 1), "stable for the same run");
         assert_eq!(a.parent(), Some(runs_dir(7, 1).as_path()), "pin lives in the dossier dir");
         assert!(a.ends_with("session.jsonl"), "{a:?}");
+    }
+
+    /// The fork's title line is omp's canonical FIXED-WIDTH slot: exactly 256
+    /// bytes with the newline (`,"pad":"<spaces>"}` tail). omp's scanner
+    /// strips the slot only at this exact width — any other width leaves the
+    /// title line in the entry stream and resume dies with «the session header
+    /// is missing or malformed» (the item-13 outage).
+    #[test]
+    fn title_slot_line_is_exactly_the_canonical_width() {
+        let line = title_slot_line("Fork: Rename radar titles", "2026-10-13T11:00:00.000Z");
+        assert_eq!(line.len() + 1, TITLE_SLOT_BYTES, "{line}");
+        assert!(line.ends_with("\"}"), "{line}");
+        assert!(line.contains(",\"pad\":\""), "{line}");
+        // everything after `,"pad":"` up to the closing quote is spaces
+        let pad = line.split_once(",\"pad\":\"").unwrap().1;
+        let pad = pad.strip_suffix("\"}").unwrap();
+        assert!(!pad.is_empty(), "a normal title leaves real padding");
+        assert!(pad.chars().all(|c| c == ' '), "{pad:?}");
+        // the payload survives a round-trip parse with its fields intact
+        let v: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(v["type"], "title");
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["title"], "Fork: Rename radar titles");
+        assert_eq!(v["source"], "auto");
+        assert_eq!(v["updatedAt"], "2026-10-13T11:00:00.000Z");
+        // an absurdly long title is truncated, never overflows the slot
+        let long = "ж".repeat(500);
+        let line = title_slot_line(&long, "2026-10-13T11:00:00.000Z");
+        assert_eq!(line.len() + 1, TITLE_SLOT_BYTES, "truncated to fit");
+        let v: serde_json::Value = serde_json::from_str(&line).expect("truncated still valid JSON");
+        assert!(v["title"].as_str().unwrap().starts_with("жжж"), "prefix kept");
+    }
+
+    /// The resolver's loop: first `Some` wins, `sleep` fires only between
+    /// misses, and exhaustion returns `None` (the loud follow-up-fresh warn).
+    #[test]
+    fn poll_until_stops_at_first_hit_and_respects_attempts() {
+        let mut sleeps = 0u32;
+        let mut n = 0u32;
+        let hits = poll_until(10, Duration::from_millis(1), |_| sleeps += 1, || {
+            n += 1;
+            (n >= 3).then_some(n) // miss, miss, hit on the 3rd call
+        });
+        assert_eq!(hits, Some(3));
+        assert_eq!(sleeps, 2, "sleep between misses only");
+        let mut calls = 0u32;
+        let none = poll_until(4, Duration::from_millis(1), |_| {}, || {
+            calls += 1;
+            None::<u8>
+        });
+        assert_eq!(none, None, "exhaustion is None");
+        assert_eq!(calls, 4, "exactly `attempts` probes");
     }
 
     /// The model pin: an empty `[delegation] model` (the default — and the

@@ -368,16 +368,6 @@ pub fn sessions_dir() -> PathBuf {
     config().sessions_dir.clone()
 }
 
-/// Dedicated omp session file of the orchestrator rpc child,
-/// `<data_dir>/atlas-orchestrator.jsonl`. `omp --session <path>` creates the
-/// session at this exact path on first spawn and resumes it (and ONLY it) on
-/// every later spawn — the orchestrator can never `-c` into an unrelated
-/// latest session of its cwd. Verified against omp v18.6.1 (`omp --session
-/// <missing path>` starts a new session there; the same flag resumes by path).
-pub fn orch_session_file() -> PathBuf {
-    data_dir().join("atlas-orchestrator.jsonl")
-}
-
 pub fn projects_dir() -> PathBuf {
     config().projects_dir.clone()
 }
