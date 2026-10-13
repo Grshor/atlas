@@ -284,11 +284,13 @@ function pruneDelegFbDrafts(data) {
   }
 }
 
-/* провал → восстановление на карточке: «Возобновить» (главная) раскрывает
-   фидбек — reject вернёт дело в queued, следующий preview покажет сессию
-   провального хода (resume=…) и «отправить» продолжит её; «Повторить» —
-   свежий прогон по сохранённой цели (без фидбека сессия новая). Журнал и
-   причина провала — как раньше, по клику на чип ✗. */
+/* провал → восстановление на карточке: «Продолжить» (главная, частый случай) —
+   один клик: reject с фиксированным фидбеком «продолжай с того места, где
+   остановился» + запуск по сохранённой цели, воркер продолжит свою сессию;
+   «Возобновить» раскрывает фидбек — reject вернёт дело в queued, следующий
+   preview покажет сессию провального хода (resume=…) и «отправить» продолжит
+   её; «Повторить» — свежий прогон по сохранённой цели (без фидбека сессия
+   новая). Журнал и причина провала — как раньше, по клику на чип ✗. */
 function delegFailedRow(it) {
   const row = el('div', 'deleg-failed-row');
   const rw = el('div', 'drow deleg-rej hidden');
@@ -321,6 +323,38 @@ function delegFailedRow(it) {
   ta.addEventListener('blur', () => {
     setTimeout(() => { if (ta.isConnected) draft.focus = false; }, 0);
   });
+  let retry = null; /* «Повторить» — только при сохранённой цели */
+  /* «Продолжить» — частый случай, один клик, кнопка-глиф ↻ (не путать с ▶
+     «делегировать» рядом и ↺ «вернуть»): reject с фиксированным фидбеком
+     вернёт дело в queued, следом запуск по сохранённой цели; воркер продолжит
+     свою записанную сессию с места остановки. Ручной reject обнуляет
+     delegation_attempts — этот перезапуск в счётчик автопилота не попадает. */
+  const cont = el('button', 'btn95 deleg-continue', '↻');
+  cont.type = 'button';
+  cont.title = 'продолжить после провала (как «продолжай» + запуск)';
+  cont.setAttribute('aria-label', cont.title);
+  cont.addEventListener('click', async () => {
+    cont.disabled = true; resume.disabled = true; if (retry) retry.disabled = true;
+    try {
+      await api('/api/board/item/' + it.id + '/reject', jsonOpts('POST', { feedback: 'продолжай с того места, где остановился' }));
+    } catch (e) {
+      cont.disabled = false; resume.disabled = false; if (retry) retry.disabled = false;
+      log('✗ продолжить не удалось: ' + e.message);
+      probeSet(false);
+      return;
+    }
+    try {
+      await api('/api/board/item/' + it.id + '/delegate', jsonOpts('POST', { target }));
+      log('✓ продолжаю: ' + (it.title || it.id) + ' (попытка после провала)');
+      loadBoard();
+    } catch (e) {
+      cont.disabled = false; resume.disabled = false; if (retry) retry.disabled = false;
+      const busy = String(e.message).indexOf('409') !== -1;
+      log(busy ? '⋯ уже запущено: ' + (it.title || it.id) : '✗ продолжить не удалось: ' + e.message);
+      if (!busy) probeSet(false);
+    }
+  });
+  row.appendChild(cont);
   const resume = el('button', 'mini deleg-resume', 'Возобновить');
   resume.type = 'button';
   resume.title = 'вернуть с фидбеком — воркер продолжит свою сессию';
@@ -336,7 +370,7 @@ function delegFailedRow(it) {
   row.appendChild(resume);
   const target = it.delegation && it.delegation.target;
   if (target) {
-    const retry = el('button', 'mini deleg-retry', 'Повторить');
+    retry = el('button', 'mini deleg-retry', 'Повторить');
     retry.type = 'button';
     retry.title = 'свежая делегация (' + targetLabel(target) + ') — без фидбека, новая сессия';
     retry.addEventListener('click', () => delegPreview(it, target));
@@ -393,8 +427,10 @@ async function delegPreview(it, target) {
   const pre = el('pre', 'deleg-brief', esc(String((r && r.brief) || '')));
   dlg.appendChild(pre);
   const btns = el('div', 'dbtns');
-  const send = el('button', 'btn95', 'отправить');
-  const cancel = el('button', 'btn95', 'отмена');
+  const send = el('button', 'btn95', 'отправить'); /* слово: запуск воркера — дорого отменять */
+  const cancel = el('button', 'btn95 ic', '✕');
+  cancel.title = 'отмена — закрыть без запуска (Esc)';
+  cancel.setAttribute('aria-label', 'отмена');
   btns.append(send, cancel);
   dlg.appendChild(btns);
   ov.appendChild(dlg);
@@ -472,9 +508,15 @@ function openDelegLog(it) {
   const out = el('div', 'tasks-out deleg-log');
   dlg.appendChild(out);
   const btns = el('div', 'dbtns');
-  const cancel = el('button', 'btn95', 'отменить');
-  const rev = el('button', 'btn95', 'к ревью');
-  const close = el('button', 'btn95', 'закрыть');
+  const cancel = el('button', 'btn95 ic', '■');
+  cancel.title = 'прервать ход делегации (спросит подтверждение)';
+  cancel.setAttribute('aria-label', 'отменить делегацию');
+  const rev = el('button', 'btn95 ic', '👁');
+  rev.title = 'к ревью — открыть ревью делегации';
+  rev.setAttribute('aria-label', 'к ревью');
+  const close = el('button', 'btn95 ic', '✕');
+  close.title = 'закрыть журнал';
+  close.setAttribute('aria-label', 'закрыть');
   btns.append(cancel, rev, close);
   dlg.appendChild(btns);
   ov.appendChild(dlg);
@@ -672,7 +714,9 @@ async function openDelegReview(it) {
   const merge = el('button', 'btn95', 'принять и смержить');
   const plain = el('button', 'btn95', 'принять без мержа');
   const rej = el('button', 'btn95', 'вернуть с фидбеком');
-  const close = el('button', 'btn95', 'закрыть');
+  const close = el('button', 'btn95 ic', '✕');
+  close.title = 'закрыть ревью';
+  close.setAttribute('aria-label', 'закрыть');
   btns.append(merge, plain, rej, close);
   dlg.appendChild(btns);
   ov.appendChild(dlg);
@@ -824,29 +868,33 @@ function boardCard(it, done) {
   }
   meta.appendChild(el('span', 'push'));
   if (it.project) {
-    const go = el('button', 'mini', '→ проект');
+    const go = el('button', 'mini ic', '→');
     go.type = 'button';
-    go.title = 'запомнить выбор: ' + it.project;
+    go.title = 'к проекту: ' + it.project + ' (запомнить выбор)';
+    go.setAttribute('aria-label', 'проект: ' + it.project);
     go.addEventListener('click', () => selectProject(it.project));
     meta.appendChild(go);
   }
   if (done) {
-    const back = el('button', 'mini', '↺ вернуть');
+    const back = el('button', 'mini ic', '↺');
     back.type = 'button';
     back.title = 'вернуть дело в квадрант (done: false)';
+    back.setAttribute('aria-label', 'вернуть');
     back.addEventListener('click', () => setBoardDone(it, false));
     meta.appendChild(back);
   } else {
     /* ▶ делегировать / ⏳ посмотреть лог — только когда ключ delegation есть */
     if (it.delegation !== undefined) meta.appendChild(delegButton(it));
-    const ed = el('button', 'mini', '✎');
+    const ed = el('button', 'mini ic', '✎');
     ed.type = 'button';
     ed.title = 'описание и файлы дела';
+    ed.setAttribute('aria-label', 'описание и файлы дела');
     ed.addEventListener('click', () => editBoardItem(it));
     meta.appendChild(ed);
-    const ok = el('button', 'mini card-ok', '✓');
+    const ok = el('button', 'mini ic card-ok', '✓');
     ok.type = 'button';
     ok.title = 'выполнено';
+    ok.setAttribute('aria-label', 'выполнено');
     ok.addEventListener('click', () => setBoardDone(it, true));
     meta.appendChild(ok);
     meta.appendChild(mkSelect({
@@ -970,9 +1018,10 @@ function editBoardItem(it) {
         sinp.value = s.text;
         sinp.placeholder = 'текст шага';
         sinp.addEventListener('input', () => { s.text = sinp.value; stepsDirty = true; });
-        const x = el('button', 'mini', '✕');
+        const x = el('button', 'mini ic', '✕');
         x.type = 'button';
         x.title = 'убрать шаг';
+        x.setAttribute('aria-label', 'убрать шаг');
         x.addEventListener('click', () => {
           const i = steps.indexOf(s);
           if (i >= 0) steps.splice(i, 1);
@@ -982,10 +1031,11 @@ function editBoardItem(it) {
         r.append(cb, sinp, x);
         slist.appendChild(r);
       }
-      const add = el('button', 'mini step-add', '+ шаг');
+      const add = el('button', 'mini ic step-add', '⊕');
       add.type = 'button';
       add.disabled = steps.length >= STEPS_CAP;
       add.title = steps.length >= STEPS_CAP ? 'не больше 20 шагов' : 'добавить пустой шаг';
+      add.setAttribute('aria-label', 'добавить пустой шаг');
       add.addEventListener('click', () => {
         if (steps.length < STEPS_CAP) { steps.push({ text: '', done: false }); stepsDirty = true; renderSteps(); }
       });
@@ -1110,8 +1160,10 @@ function editBoardItem(it) {
 
   /* --- кнопки/клавиши диалога --- */
   const btns = el('div', 'dbtns');
-  const ok = el('button', 'btn95', 'Сохранить');
-  const cancel = el('button', 'btn95', 'Отмена');
+  const ok = el('button', 'btn95', 'Сохранить'); /* слово: PUT затирает чужие правки целиком */
+  const cancel = el('button', 'btn95 ic', '✕');
+  cancel.title = 'закрыть без сохранения (Esc)';
+  cancel.setAttribute('aria-label', 'отмена без сохранения');
   btns.append(ok, cancel);
   dlg.appendChild(btns);
   ov.appendChild(dlg);
@@ -1229,7 +1281,7 @@ function buildBoard(root) {
     grid += '<section class="quad ' + qk + ' out">' +
       '<header><span class="mark"></span><span class="ttl">' + qk + ' · ' + label + '</span>' +
       '<span class="qcount" id="qcount-' + qk + '" title="активных дел">0</span>' +
-      '<button class="mini" type="button" data-add="' + qk + '" title="новое дело в ' + qk + '">+ дело</button></header>' +
+      '<button class="mini ic" type="button" data-add="' + qk + '" title="новое дело в ' + qk + '" aria-label="новое дело">⊕</button></header>' +
       '<div class="cards in" id="cards-' + qk + '"></div></section>';
     if (qk === 'q2') grid += '<div class="board-split" id="bsplit" title="потянуть — высота рядов доски (20–80%)"></div>';
   }

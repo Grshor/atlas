@@ -289,9 +289,10 @@ function archRow(p) {
   const path = el('td', 'path-cell dim', esc(p.path || '—'));
   path.title = p.path || '';
   const btns = el('td');
-  const back = el('button', 'mini', '⬆');
+  const back = el('button', 'mini ic', '↺');
   back.type = 'button';
   back.title = 'вернуть в основной список (archived: false)';
+  back.setAttribute('aria-label', 'вернуть');
   back.addEventListener('click', (ev) => { ev.stopPropagation(); setArchived(p, false); });
   btns.appendChild(back);
   tr.append(name, act, path, btns);
@@ -701,9 +702,10 @@ function fillChromeProjects() {
     ch.p.count = mk('span', 'dim');
     ch.p.arch = mk('span', 'dim');
     ch.p.filt = mk('span', 'dim hidden');
-    const b = mk('button', 'btn95', '⟳ Обновить');
+    const b = mk('button', 'btn95 ic', '⟳');
     b.type = 'button';
     b.title = 'перечитать список проектов';
+    b.setAttribute('aria-label', 'обновить');
     b.addEventListener('click', () => { log('обновление…'); loadProjects(); });
   });
   updateProjectsChrome();
@@ -723,9 +725,9 @@ function buildProjects(root) {
       '<div class="toolbar">' +
         '<input id="filter" class="fld" style="width:180px" placeholder="фильтр: (/)" autocomplete="off" spellcheck="false">' +
         '<span id="groupsel-wrap"></span>' +
-        '<button id="btn-arch" class="btn95" type="button" disabled title="в подвал, ничего не удаляется">⤓ выбросить вниз</button>' +
-        '<button id="btn-refresh" class="btn95 tb-fallback" type="button" title="перечитать список">⟳ Обновить</button>' +
-        '<button id="btn-sync" class="btn95" type="button" title="синхронизировать все источники">Синхронизировать источники</button>' +
+        '<button id="btn-arch" class="btn95 ic" type="button" disabled title="в подвал, ничего не удаляется" aria-label="выбросить вниз">⤓</button>' +
+        '<button id="btn-refresh" class="btn95 ic tb-fallback" type="button" title="перечитать список" aria-label="обновить">⟳</button>' +
+        '<button id="btn-sync" class="btn95 ic" type="button" title="синхронизировать все источники" aria-label="синхронизировать источники">⇄</button>' +
         '<button id="btn-weburl" class="btn95" type="button" title="назначить локальный веб-URL выбранному проекту (http://127.0.0.1|localhost:порт; пусто — сбросить)">⊕ URL</button>' +
         '<span class="spacer"></span>' +
         winControlsHtml() +
@@ -955,15 +957,17 @@ function renderMakeDrawer() {
   const bar = el('div', 'tasks-bar');
   if (active) {
     bar.appendChild(el('span', 'spin', '⏳ выполняется…'));
-    const stop = el('button', 'btn95', '■ остановить');
+    const stop = el('button', 'btn95 ic', '■');
     stop.type = 'button';
-    stop.title = 'послать kill текущей задаче';
+    stop.title = 'остановить — послать kill текущей задаче';
+    stop.setAttribute('aria-label', 'остановить');
     stop.addEventListener('click', makeKill);
     bar.appendChild(stop);
   } else {
-    const go = el('button', 'btn95', '▶ запустить');
+    const go = el('button', 'btn95 ic', '▶');
     go.type = 'button';
     go.title = 'запустить цель «' + (makeTarget || '?') + '»';
+    go.setAttribute('aria-label', 'запустить');
     go.addEventListener('click', makeRunStart);
     bar.appendChild(go);
   }

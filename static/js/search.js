@@ -69,9 +69,10 @@ function renderSearch(hits, q) {
       '<span class="r-title">' + esc(h.title || '(без названия)') + '</span>' +
       '<span class="scores">' + scoreText(h) + '</span>';
     if (h.file && openAvailable !== false) {
-      const fb = el('button', 'mini r-file', '↗ файл');
+      const fb = el('button', 'mini ic r-file', '↗');
       fb.type = 'button';
       fb.title = 'открыть файл: ' + h.file;
+      fb.setAttribute('aria-label', 'открыть файл');
       fb.addEventListener('click', () => openHitFile(h, fb));
       head.appendChild(fb);
     }

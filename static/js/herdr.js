@@ -145,7 +145,7 @@ function buildHerdr(root) {
     '<div class="panel" style="grid-template-rows:auto minmax(0,1fr) auto">' +
       '<div class="toolbar">' +
         '<input id="herdr-filter" class="fld" style="width:180px" placeholder="фильтр: по label (/)" autocomplete="off" spellcheck="false">' +
-        '<button id="herdr-refresh" class="btn95" type="button" title="перечитать состояние herdr">⟳ Обновить</button>' +
+        '<button id="herdr-refresh" class="btn95 ic" type="button" title="перечитать состояние herdr" aria-label="обновить">⟳</button>' +
         '<span id="herdr-stat" class="dim"></span>' +
         '<span class="spacer"></span>' +
         winControlsHtml() +
@@ -162,9 +162,10 @@ function buildHerdr(root) {
     ch.h = {};
     setChrome((mk) => {
       ch.h.client = mk('span', 'dim', 'клиент: неизвестно');
-      const b = mk('button', 'btn95', '⟳ Обновить');
+      const b = mk('button', 'btn95 ic', '⟳');
       b.type = 'button';
       b.title = 'перечитать состояние herdr';
+      b.setAttribute('aria-label', 'обновить');
       b.addEventListener('click', loadHerdr);
     });
     herdrFillChrome();

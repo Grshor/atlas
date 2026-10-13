@@ -184,15 +184,18 @@ function sttRender() {
       b.textContent = 'распознаю…';
       b.disabled = true;
       b.title = 'распознаю запись…';
+      b.setAttribute('aria-label', 'распознаю запись');
     } else if (sttRecording) {
       const s = sttStartedAt ? Math.max(0, Math.round((Date.now() - sttStartedAt) / 1000)) : 0;
       b.textContent = '● ' + s + 'с';
       b.disabled = false;
       b.title = 'идёт запись — клик: остановить и вставить';
+      b.setAttribute('aria-label', 'остановить запись и вставить');
     } else {
       b.textContent = '🎙';
       b.disabled = false;
       b.title = 'голосовой ввод: клик — начать, повторный клик — остановить и вставить';
+      b.setAttribute('aria-label', 'голосовой ввод');
     }
   }
 }

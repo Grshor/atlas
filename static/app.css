@@ -102,6 +102,20 @@ button { font: inherit; color: var(--palette-foreground); }
   line-height: 1.5;
   cursor: pointer;
 }
+/* пиктограммная кнопка (.ic): квадрат с глифом по центру; слово живёт в
+   title/aria-label, журнал остаётся словесным */
+.btn95.ic, .mini.ic {
+  width: 20px;
+  min-width: 0;
+  padding-left: 0;
+  padding-right: 0;
+  text-align: center;
+}
+#chrome .btn95.ic { padding-top: 1px; padding-bottom: 1px; }
+.btn95.ic:focus-visible, .mini.ic:focus-visible {
+  outline: 1px dotted var(--palette-accent);
+  outline-offset: -3px;
+}
 .fld {
   font: inherit;
   color: var(--palette-foreground);
@@ -696,6 +710,8 @@ body.rowsizing, body.rowsizing * { cursor: row-resize !important; user-select: n
 .card .deleg-failed-row .deleg-rej .fld { width: 100%; font: inherit; resize: vertical; }
 .card .deleg-failed-row .deleg-rej-send { justify-self: start; }
 .card .deleg-resume { color: var(--palette-yellow); }
+/* ↻ «продолжить после провала» — главное действие строки: акцентом и компактно */
+.card .deleg-continue { color: var(--palette-accent); padding: 1px 7px; font-size: 12px; line-height: 1; }
 
 /* блок выполненных дел — один на всю доску, внизу панели, свёрнут по умолчанию */
 .done-block { margin: 0; }

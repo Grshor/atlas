@@ -82,7 +82,7 @@ function buildSources(root) {
   root.innerHTML =
     '<div class="panel src-panel">' +
       '<div class="toolbar">' +
-        '<button id="btn-sync-src" class="btn95 tb-fallback" type="button" data-act="sync" title="синхронизировать все источники">⟳ Синхронизировать</button>' +
+        '<button id="btn-sync-src" class="btn95 ic tb-fallback" type="button" data-act="sync" title="синхронизировать все источники" aria-label="синхронизировать источники">⇄</button>' +
         '<span class="dim">записи по источникам; синк обновляет индекс</span>' +
         '<span class="spacer"></span>' +
         winControlsHtml() +
@@ -102,10 +102,11 @@ function buildSources(root) {
   chromeFillers.sources = () => {
     ch.s = {};
     setChrome((mk) => {
-      const b = mk('button', 'btn95', '⟳ Синхронизировать');
+      const b = mk('button', 'btn95 ic', '⇄');
       b.type = 'button';
       b.dataset.act = 'sync';
       b.title = 'синхронизировать все источники';
+      b.setAttribute('aria-label', 'синхронизировать источники');
       b.addEventListener('click', syncSources);
       ch.s.age = mk('span', 'dim');
     });
