@@ -2383,7 +2383,7 @@ async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
         }
     };
     if matches!(session, omp_rpc::Session::Fresh(_)) {
-        spawn_session_resolver(item.id, run_id, session_dir, spawned_at);
+        spawn_session_resolver(item.id, run_id, session_dir.clone(), spawned_at);
     }
     // unit mode: systemd-run is the direct child (the `--pipe` fd holder);
     // the pid that cancel operates on is the unit's real MainPID.
@@ -2498,6 +2498,8 @@ async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
     let watch_ref = plan.reference.clone();
     let obs_r = Arc::clone(&obs);
     let stdin_w = Arc::clone(&stdin_cell);
+    let tail_dir = session_dir;
+    let tail_born = spawned_at;
     std::thread::spawn(move || {
         let obs = obs_r;
         // stdin stays open for the whole turn — the rpc host treats EOF as a
@@ -2532,14 +2534,29 @@ async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
             None => "— ход запущен (свежая сессия) —".to_string(),
         });
 
-        while let Some(f) = frames.next() {
+        // The turn loop: rpc frames when the wire speaks, the session-file
+        // tail when it doesn't. A generation streams NO frames for minutes
+        // (the steer answer cannot arrive either — omp queues it until the
+        // turn ends), but omp still journals the step to the run's session
+        // file as it happens: each wait is capped at the tail cadence, so a
+        // silent stretch still wakes to read the file's increment. The pass
+        // itself no-ops faster than [`TAIL_CADENCE`].
+        let mut tail = SessionTail::new(tail_dir, tail_born);
+        loop {
             if cancelled.load(Ordering::SeqCst) {
                 break;
             }
-            runner::lock(&obs).frame(Instant::now());
-            mirror_frame(&mut mirror, &run, &f);
-            if mirror.ended {
-                break;
+            match frames.next_within(Instant::now() + tail.every) {
+                omp_rpc::Next::Frame(f) => {
+                    runner::lock(&obs).frame(Instant::now());
+                    mirror_frame(&mut mirror, &run, &f);
+                    tail.pass(&mirror, &run);
+                    if mirror.ended {
+                        break;
+                    }
+                }
+                omp_rpc::Next::Timeout => tail.pass(&mirror, &run),
+                omp_rpc::Next::Eof => break,
             }
         }
         drop(runner::lock(&stdin_w).take()); // EOF → the idle rpc host exits
@@ -2813,6 +2830,194 @@ fn last_assistant_text(f: &Value) -> Option<String> {
     None
 }
 
+// ------------------------------------------------------- session tailer ----
+
+/// How often the turn watcher may pass over the run's live session file —
+/// light enough never to matter, dense enough for the journal to look live.
+const TAIL_CADENCE: Duration = Duration::from_secs(5);
+
+/// A session record larger than this is skipped unread: assistant texts and
+/// tool starts are small; a multi-megabyte toolResult would only burn the
+/// parse for nothing the journal needs.
+const TAIL_RECORD_CAP: usize = 256 << 10;
+
+/// Incremental reader of the run's live omp session file — the reliable
+/// window into a worker. omp journals every step (assistant texts, tool
+/// executions) into a JSONL file inside the run's dossier WHILE the turn
+/// runs, so the watcher reads the file's INCREMENT and the ring shows what
+/// the worker is doing even when the rpc wire is silent (a long generation
+/// streams no frames — the 1496-с тишина incident). No worker cooperation.
+struct SessionTail {
+    /// The run's dossier dir: a fresh spawn mints its session file here
+    /// (~15 s in), a fork copy sits here from the start (known synchronously).
+    dir: PathBuf,
+    /// The spawn watermark — only files not older than it are this run's.
+    not_before: std::time::SystemTime,
+    /// The resolved session file; `None` until omp mints one.
+    path: Option<PathBuf>,
+    /// Bytes already reported. The offset IS the dedup: a record is pushed
+    /// exactly once no matter how many passes re-open the file.
+    offset: u64,
+    /// Minimum gap between passes; tests zero it.
+    every: Duration,
+    last: Option<Instant>,
+}
+
+impl SessionTail {
+    fn new(dir: PathBuf, not_before: std::time::SystemTime) -> SessionTail {
+        SessionTail {
+            dir,
+            not_before,
+            path: None,
+            offset: 0,
+            every: TAIL_CADENCE,
+            last: None,
+        }
+    }
+
+    /// One pass over the appended bytes. `mirror` suppresses what the rpc
+    /// wire already delivered (a healthy turn streams both ways; the tail
+    /// exists for the silent ones). Every failure mode is a quiet skip: the
+    /// file not minted yet, a read race, a torn record.
+    fn pass(&mut self, mirror: &Mirror, run: &runner::Run) {
+        if self.last.is_some_and(|t| t.elapsed() < self.every) {
+            return;
+        }
+        self.last = Some(Instant::now());
+        if self.path.is_none() {
+            let Some(p) = omp_rpc::resolve_fresh_session(&self.dir, self.not_before) else {
+                return; // not minted yet — quietly
+            };
+            // history stays history: bytes already on disk at first sight
+            // (a fork copy carries the project's whole prior session) are
+            // skipped — only records the worker writes from now on are news.
+            self.offset = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            self.path = Some(p);
+        }
+        let Some(path) = self.path.clone() else { unreachable!("resolved above") };
+        let size = match std::fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(_) => return,
+        };
+        if size < self.offset {
+            self.offset = 0; // truncation/rotation — start over per contract
+        }
+        if size == self.offset {
+            return;
+        }
+        let mut appended = Vec::new();
+        {
+            use std::io::{Seek, SeekFrom};
+            let Ok(mut f) = std::fs::File::open(&path) else { return };
+            if f.seek(SeekFrom::Start(self.offset)).is_err() || f.read_to_end(&mut appended).is_err()
+            {
+                return;
+            }
+        }
+        // hold back an incomplete last line until its rest arrives
+        let Some(cut) = appended.iter().rposition(|&b| b == b'\n') else {
+            return;
+        };
+        self.offset += cut as u64 + 1;
+        for raw in appended[..=cut].split(|&b| b == b'\n') {
+            if let Some(line) = session_record_line(raw, mirror) {
+                run.push_line(line);
+            }
+        }
+    }
+}
+
+/// One session record → one ring line; `None` for everything the journal
+/// does not need (session/title/model metadata, thinking, tool results, the
+/// brief echo). Shapes are omp v18 session files, taken from the real runs
+/// (`runs/13-r1`, dev `19/20/21/23-r1`): `{"type":"message","message":{role,
+/// content:[…]}}` and `{"type":"custom","customType":"tool_execution_start",
+/// "data":{toolName,args,intent}}`.
+fn session_record_line(raw: &[u8], mirror: &Mirror) -> Option<String> {
+    if raw.len() > TAIL_RECORD_CAP {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(raw).ok()?;
+    match v.get("type").and_then(|t| t.as_str())? {
+        "message" => session_message_line(&v, mirror),
+        "custom" => {
+            if v.get("customType").and_then(|t| t.as_str()) != Some("tool_execution_start") {
+                return None;
+            }
+            let d = v.get("data")?;
+            let name = d.get("toolName").and_then(|t| t.as_str()).unwrap_or("tool");
+            let args = d.get("args");
+            // the ledger doubles as the wire dedup: a call the rpc wire
+            // already mirrored sits in `cmds` — the tail stays silent
+            if mirror
+                .cmds
+                .iter()
+                .any(|c| c.command == cmd_text(name, args))
+            {
+                return None;
+            }
+            match d.get("intent").and_then(|i| i.as_str()).map(str::trim) {
+                Some(i) if !i.is_empty() => {
+                    let mut line = format!("· {name}: {i}");
+                    if line.chars().count() > 220 {
+                        line = line.chars().take(220).collect::<String>() + "…";
+                    }
+                    Some(line)
+                }
+                _ => {
+                    // exactly the wire mirror's shape: `· name <args json>`
+                    let mut detail = args.map(|a| a.to_string()).unwrap_or_default();
+                    if detail.chars().count() > 220 {
+                        detail = detail.chars().take(220).collect::<String>() + "…";
+                    }
+                    Some(format!("· {name} {detail}"))
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The `сессия: …` line: an assistant text message, compacted to one line.
+/// Thinking and toolCall parts never surface (thinking floods, calls come
+/// through the `tool_execution_start` records); non-assistant roles — the
+/// brief echo, tool results — are skipped. A text the rpc wire already
+/// streamed into the turn text is skipped too: the tail reports only what
+/// the wire missed.
+fn session_message_line(v: &Value, mirror: &Mirror) -> Option<String> {
+    let m = v.get("message")?;
+    if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+        return None;
+    }
+    let mut text = String::new();
+    for part in m.get("content")?.as_array()?.iter() {
+        if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(t);
+            }
+        }
+    }
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    // whitespace-insensitive containment: the wire's delta stream wraps the
+    // same words across its own line breaks
+    let solid = compact.replace(' ', "");
+    let streamed = mirror.text.split_whitespace().collect::<String>();
+    if !streamed.is_empty() && streamed.contains(&solid) {
+        return None;
+    }
+    let mut line = compact;
+    if line.chars().count() > 200 {
+        line = line.chars().take(200).collect::<String>() + "…";
+    }
+    Some(format!("сессия: {line}"))
+}
+
 /// The start row + its info notification, in one blocking DB step. Called
 /// BEFORE the child spawns — the running row is visible while it runs.
 async fn write_start(
@@ -3020,10 +3225,23 @@ fn worker_made_changes(dir: &Path, start: Option<&str>) -> bool {
 /// short by design: the answer streams into the run ring like any other text.
 const STATUS_PROMPT: &str = "доложи кратко текущий статус по задаче";
 
+/// Repeated «— запрошен статус у воркера —» ring lines inside this window
+/// collapse into one: omp answers a steer only at the END of the worker's
+/// current step, so a second press within two minutes adds nothing but spam
+/// (the owner pressed twice in a minute and got nothing both times).
+const STATUS_ASK_DEDUP: Duration = Duration::from_secs(120);
+
+/// Per item: when the «запрошен статус» line last went out. The steer itself
+/// is never suppressed — only the ring noise.
+static STATUS_ASKED: LazyLock<Mutex<HashMap<i64, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// `POST …/delegate/status` — ask the RUNNING orchestrator worker for a brief
-/// status: a `steer` frame into the rpc child's stdin. The worker answers at
-/// the next step boundary of its live turn; the answer flows into the run
-/// ring as ordinary streamed text — no second `agent_end`, so the settle
+/// status: a `steer` frame into the rpc child's stdin. omp processes a steer
+/// only when the worker's CURRENT step ends — mid-generation it is queued,
+/// nothing answers until then (the live session tail is the window that
+/// works meanwhile). The answer flows into the run ring as ordinary streamed
+/// text — no second `agent_end`, so the settle
 /// contract (review/needs-feedback/failed on the one terminal `agent_end`)
 /// stays untouched. Only an rpc delegation has a stdin to steer; the `omp -p`
 /// targets (worktree/dir) have no input channel after launch. A steer racing
@@ -3063,7 +3281,20 @@ pub async fn request_status(item_id: i64) -> Result<Value, Error> {
     if !wrote {
         return Err(Error::Busy("ход завершается — stdin уже закрыт".to_string()));
     }
-    job.run.push_line("— запрошен статус у воркера —".to_string());
+    let announce = {
+        let mut seen = runner::lock(&STATUS_ASKED);
+        let due = seen
+            .get(&item_id)
+            .map(|t| t.elapsed() >= STATUS_ASK_DEDUP)
+            .unwrap_or(true);
+        if due {
+            seen.insert(item_id, Instant::now());
+        }
+        due
+    };
+    if announce {
+        job.run.push_line("— запрошен статус у воркера —".to_string());
+    }
     publish_run(item_id, "running");
     Ok(json!({"ok": true}))
 }
@@ -4192,6 +4423,195 @@ mod tests {
         let long = "x".repeat(500);
         let got = cmd_text("bash", Some(&serde_json::json!({"command": long})));
         assert!(got.chars().count() <= 201, "capped, got {}", got.chars().count());
+    }
+
+    // ------------------------------------------------ session tailer ----
+
+    /// A real (sanitized) omp v18 session header — dev run 23-r1.
+    fn rec_header() -> String {
+        r#"{"type":"session","version":3,"id":"01a135fb-683f-7765-be37-22e01dcd74c1","timestamp":"2026-10-13T15:57:11.103Z","cwd":"/tmp/probe","title":"smoke"}"#.into()
+    }
+    /// A real (sanitized) assistant message: thinking + text parts.
+    fn rec_assistant_text() -> String {
+        json!({
+            "type": "message", "id": "m1", "parentId": null,
+            "timestamp": "2026-10-13T15:57:40.000Z",
+            "message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Составлю план"},
+                {"type": "text", "text": "План:\n1. Файлы прочитаны.\n2. Считаю: 2+2=4.\n3. Пишу промежуточный вывод в чат."}
+            ]}
+        }).to_string()
+    }
+    /// A real (sanitized) `tool_execution_start` custom record — dev run 23-r1.
+    fn rec_tool_start() -> String {
+        json!({
+            "type": "custom", "customType": "tool_execution_start",
+            "id": "c1", "parentId": null, "timestamp": "2026-10-13T15:57:29.635Z",
+            "data": {
+                "toolCallId": "call_55803b0836e4415aac110971",
+                "toolName": "bash",
+                "startedAt": "2026-10-13T15:57:29.635Z",
+                "args": {"command": "sleep 75"},
+                "intent": "Sleeping 75 seconds per smoke task"
+            }
+        }).to_string()
+    }
+
+    fn tailer(dir: &Path) -> SessionTail {
+        let mut t = SessionTail::new(
+            dir.to_path_buf(),
+            std::time::SystemTime::now() - Duration::from_secs(30),
+        );
+        t.every = Duration::ZERO; // tests: every pass really passes
+        t
+    }
+
+    /// The record → ring-line contract on the real shapes: assistant text
+    /// compacts under `сессия: `, a tool start prefers its intent, metadata
+    /// and thinking-only records never surface.
+    #[test]
+    fn session_record_line_reads_the_real_shapes() {
+        let m = Mirror::default();
+        assert_eq!(
+            session_record_line(rec_assistant_text().as_bytes(), &m),
+            Some("сессия: План: 1. Файлы прочитаны. 2. Считаю: 2+2=4. 3. Пишу промежуточный вывод в чат.".into())
+        );
+        assert_eq!(
+            session_record_line(rec_tool_start().as_bytes(), &m),
+            Some("· bash: Sleeping 75 seconds per smoke task".into())
+        );
+        // no intent → exactly the wire mirror's shape
+        let bare = json!({
+            "type": "custom", "customType": "tool_execution_start",
+            "data": {"toolCallId": "x", "toolName": "read", "args": {"path": "/a"}}
+        })
+        .to_string();
+        assert_eq!(
+            session_record_line(bare.as_bytes(), &m),
+            Some("· read {\"path\":\"/a\"}".into())
+        );
+        // metadata, thinking-only, the brief echo, tool results — silent
+        assert_eq!(session_record_line(rec_header().as_bytes(), &m), None);
+        let thinking = json!({
+            "type": "message", "message": {"role": "assistant",
+            "content": [{"type": "thinking", "thinking": "…"}]}
+        })
+        .to_string();
+        assert_eq!(session_record_line(thinking.as_bytes(), &m), None);
+        let brief = json!({
+            "type": "message", "message": {"role": "user",
+            "content": [{"type": "text", "text": "бриф"}]}
+        })
+        .to_string();
+        assert_eq!(session_record_line(brief.as_bytes(), &m), None);
+        let result = json!({
+            "type": "message", "message": {"role": "toolResult",
+            "content": [{"type": "text", "text": "ок"}]}
+        })
+        .to_string();
+        assert_eq!(session_record_line(result.as_bytes(), &m), None);
+        assert_eq!(session_record_line(b"not json", &m), None);
+    }
+
+    /// What the wire already mirrored never lands twice: a streamed text and
+    /// a ledgered tool call suppress their session twins; an unseen one lands.
+    #[test]
+    fn session_tail_defers_to_the_wire_mirror() {
+        let mut m = Mirror::default();
+        let text = "План: 1. Файлы прочитаны. 2. Считаю: 2+2=4. 3. Пишу промежуточный вывод в чат.";
+        push_turn_text(&mut m, text);
+        assert_eq!(session_record_line(rec_assistant_text().as_bytes(), &m), None);
+        m.cmds.push(CmdRec { command: "sleep 75".into(), error: false });
+        assert_eq!(session_record_line(rec_tool_start().as_bytes(), &m), None);
+        assert_eq!(
+            session_record_line(rec_assistant_text().as_bytes(), &Mirror::default()),
+            Some(format!("сессия: {text}"))
+        );
+    }
+
+    /// The incremental contract on a fixture file: discovery skips history,
+    /// appends land exactly once, a torn last line is held back until its
+    /// rest arrives.
+    #[test]
+    fn session_tail_streams_increment_reports_once_holds_partial() {
+        let dir = std::env::temp_dir().join(format!("deleg-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = runner::Run::with_id(2_700_201, 0);
+        let mut t = tailer(&dir);
+        let p = dir.join("2026-10-13T15-57-11-103Z_smoke.jsonl");
+
+        // not minted yet — quietly nothing
+        t.pass(&Mirror::default(), &run);
+        assert!(run.tail_lines(10).is_empty());
+
+        // omp mints the file: first sight = discovery, history is skipped,
+        // and repeated passes over the same bytes never re-report
+        std::fs::write(&p, format!("{}\n", rec_header())).unwrap();
+        t.pass(&Mirror::default(), &run);
+        t.pass(&Mirror::default(), &run);
+        assert!(run.tail_lines(10).is_empty(), "history stays history");
+
+        // the worker journals a text and a tool call — both surface, once
+        let append = |body: &str| {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+        };
+        append(&format!("{}\n{}\n", rec_assistant_text(), rec_tool_start()));
+        t.pass(&Mirror::default(), &run);
+        t.pass(&Mirror::default(), &run);
+        assert_eq!(
+            run.tail_lines(10),
+            vec![
+                "сессия: План: 1. Файлы прочитаны. 2. Считаю: 2+2=4. 3. Пишу промежуточный вывод в чат.".to_string(),
+                "· bash: Sleeping 75 seconds per smoke task".to_string(),
+            ]
+        );
+
+        // a torn last line is held back until its rest arrives
+        append("{\"type\":\"message\",\"message\":{\"role\":\"ass");
+        t.pass(&Mirror::default(), &run);
+        assert_eq!(run.tail_lines(10).len(), 2, "torn line held back");
+        append("istant\",\"content\":[{\"type\":\"text\",\"text\":\"готово\"}]}}\n");
+        t.pass(&Mirror::default(), &run);
+        assert_eq!(run.tail_lines(10)[2], "сессия: готово");
+        assert_eq!(run.tail_lines(10).len(), 3);
+
+        // the ring cap does not care where the lines came from — the tail
+        // lands like any other line (RING_CAP is far above; just sanity)
+        assert!(!run.truncated());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shrunken file (truncation/rotation) resets the offset: records from
+    /// the top surface again instead of the tail wedging forever.
+    #[test]
+    fn session_tail_resets_offset_on_truncation() {
+        let dir = std::env::temp_dir().join(format!("deleg-tail-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = runner::Run::with_id(2_700_202, 0);
+        let mut t = tailer(&dir);
+        let p = dir.join("smoke.jsonl");
+        std::fs::write(
+            &p,
+            format!("{}\n{}\n{}\n", rec_header(), rec_assistant_text(), rec_tool_start()),
+        )
+        .unwrap();
+        t.pass(&Mirror::default(), &run); // discovery skips everything on disk
+        assert!(run.tail_lines(10).is_empty());
+
+        // truncation: the file shrinks below the consumed offset
+        std::fs::write(&p, format!("{}\n{}\n", rec_header(), rec_assistant_text())).unwrap();
+        t.pass(&Mirror::default(), &run);
+        // offset reset to 0 → the top record is re-read and re-reported
+        assert_eq!(run.tail_lines(10).len(), 1, "reset re-read from byte 0");
+        assert_eq!(
+            run.tail_lines(10)[0],
+            "сессия: План: 1. Файлы прочитаны. 2. Считаю: 2+2=4. 3. Пишу промежуточный вывод в чат."
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The persisted ledger decodes when it is JSON; absence and garbage mean

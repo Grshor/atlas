@@ -249,7 +249,7 @@ function delegButton(it) {
   if (busy && it.delegation.target === 'orchestrator') {
     const ask = el('button', 'mini deleg-ask', '❔');
     ask.type = 'button';
-    ask.title = 'запросить статус';
+    ask.title = 'запросить статус (дойдёт после текущего шага воркера)';
     ask.setAttribute('aria-label', ask.title);
     ask.addEventListener('click', async (e) => {
       e.stopPropagation();

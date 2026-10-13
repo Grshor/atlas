@@ -317,13 +317,9 @@ impl Frames {
         Frames { rx }
     }
 
-    /// The next frame, blocking without limit — the steady-state read.
-    /// `None` = the stream ended.
-    pub fn next(&self) -> Option<Value> {
-        self.rx.recv().ok()
-    }
-
-    /// The next frame if it arrives before `deadline` — the handshake read.
+    /// The next frame if it arrives before `deadline` — the only read both
+    /// drivers use (the delegation turn loop caps each wait at its tail
+    /// cadence; the handshake caps at readiness).
     pub fn next_within(&self, deadline: Instant) -> Next {
         loop {
             let now = Instant::now();
