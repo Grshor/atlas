@@ -630,6 +630,7 @@ body.rowsizing, body.rowsizing * { cursor: row-resize !important; user-select: n
 .chip.deleg-review { color: var(--palette-yellow); border-color: var(--palette-yellow); }
 .chip.deleg-failed { color: var(--palette-red); border-color: var(--palette-red); }
 .card .card-title .chip.deleg { margin-left: 5px; }
+.chip.item-id { font-size: 9.5px; color: var(--dim-fg); border-color: var(--bevel-mid); margin-left: 5px; }
 .chip.deleg .deleg-secs { font-variant-numeric: tabular-nums; }
 /* ТЗ для делегирования: read-only моноблок со скроллом */
 .deleg-brief {

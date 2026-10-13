@@ -729,8 +729,11 @@ async function toggleStep(it, step) {
 function boardCard(it, done) {
   const selCard = !!it.project && it.project === state.selected;
   const card = el('article', 'card out' + (selCard ? ' card-sel' : '') + (done ? ' card-done' : ''));
-  if (selCard) card.title = 'проект выбран: ' + it.project;
+  /* id-чип: уведомления ссылаются на «дело #N» — без него владелец не сопоставит их с карточкой */
+  card.title = 'дело #' + it.id + ': ' + (it.title || '(без названия)') +
+    (selCard ? ' · проект выбран: ' + it.project : '');
   const title = el('div', 'card-title', esc(it.title || '(без названия)'));
+  title.appendChild(el('span', 'chip item-id', '#' + it.id));
   card.appendChild(title);
   /* чип делегации — на активных карточках, когда бэкенд отдал ключ delegation */
   if (!done && it.delegation !== undefined && it.delegation) title.appendChild(delegChip(it));
