@@ -241,11 +241,64 @@ fn project_path(conn: &rusqlite::Connection, project: &str) -> Option<PathBuf> {
 
 // ------------------------------------------------------------------ brief ----
 
+/// How much of this project the worker's session already carries — the brief's
+/// intro and the files header adapt to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BriefCtx {
+    /// Fresh session, no fork taken: the worker knows nothing — the brief
+    /// points at the repository files (and graft, when present).
+    Cold,
+    /// The fork of the project's current session was created by THIS start:
+    /// the worker carries the project's conversation history.
+    ProjectFork,
+    /// The run's OWN previous session is resumed (a feedback follow-up).
+    FollowUp,
+}
+
+/// The brief's context mode from the session decision. `fork_taken` marks the
+/// fresh-start fork created by THIS start — the only ProjectFork; a Resume of
+/// the STORED session is the run's own previous attempt (FollowUp), even when
+/// that stored file is an earlier run's fork.
+fn brief_ctx(session: &omp_rpc::Session, fork_taken: bool) -> BriefCtx {
+    match session {
+        omp_rpc::Session::Fresh(_) => BriefCtx::Cold,
+        omp_rpc::Session::Resume(_) if fork_taken => BriefCtx::ProjectFork,
+        omp_rpc::Session::Resume(_) => BriefCtx::FollowUp,
+    }
+}
+
+/// The project's current omp session — the read-only probe the fork copies
+/// from and the preview's brief mode asks (the fork itself writes; the
+/// preview must not).
+fn project_session(plan_cwd: &Path) -> Option<(PathBuf, SessionHead)> {
+    let root = cfg::sessions_dir();
+    let home = cfg::home();
+    let home = home.to_string_lossy();
+    let cwd = plan_cwd.to_string_lossy();
+    find_project_session(&root, &home, &cwd)
+}
+
 /// The worker's prompt — the exact format the board/UI contract fixes.
-/// The «Шаги»/«Файлы»/«Фидбек» sections are dropped when empty.
-pub fn compile_brief(item: &Item, cwd: &Path) -> String {
+/// The «Шаги»/«Файлы»/«Фидбек» sections are dropped when empty. The intro and
+/// the files header follow the session context (`ctx`): a fork/follow-up
+/// worker already carries history, a cold one assembles it from the repo.
+pub(crate) fn compile_brief(item: &Item, cwd: &Path, ctx: BriefCtx) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {}\n", item.title));
+    match ctx {
+        BriefCtx::ProjectFork => out.push_str(
+            "Ты продолжаешь работу в проекте, который уже знаешь: в твоём контексте — \
+             история предыдущих сессий проекта (это форк актуальной сессии). Не начинай \
+             знакомство с нуля и не пересказывай известное — опирайся на неё; недостающее \
+             добирай файлами.\n",
+        ),
+        BriefCtx::FollowUp => out.push_str(
+            "Ты продолжаешь СВОЮ предыдущую попытку — сессия продолжена: ты помнишь, что \
+             делал и на чём остановился. Раздел «Фидбек» говорит, что изменилось и что \
+             делать дальше; не начинай заново.\n",
+        ),
+        BriefCtx::Cold => {}
+    }
     match item
         .description
         .as_deref()
@@ -278,7 +331,12 @@ pub fn compile_brief(item: &Item, cwd: &Path) -> String {
         }
     }
     if !item.files.is_empty() {
-        out.push_str("## Файлы (прочти перед работой)\n");
+        out.push_str(match ctx {
+            BriefCtx::Cold => "## Файлы (прочти перед работой)\n",
+            BriefCtx::ProjectFork | BriefCtx::FollowUp => {
+                "## Файлы (прочти, только если этого нет в контексте)\n"
+            }
+        });
         for f in &item.files {
             out.push_str("- ");
             out.push_str(f);
@@ -295,17 +353,26 @@ pub fn compile_brief(item: &Item, cwd: &Path) -> String {
         out.push_str(f);
         out.push('\n');
     }
-    if cwd.join("graft").exists() {
+    // graft-ориентация — указание холодному воркеру: fork/follow-up уже несёт
+    // историю проекта, слепое чтение репозитория ему не нужно.
+    if ctx == BriefCtx::Cold && cwd.join("graft").exists() {
         out.push_str(
             "В проекте есть graft/ — граф контекста кода. Для ориентации используй \
              навык graft, а не чтение репозитория вслепую.\n",
         );
     }
-    out.push_str(&format!(
+    let autonomy = format!(
         "Работай в каталоге {}. Ты работаешь автономно: ответить на вопрос некому — \
-         если данных не хватает, остановись, заполни раздел ВОПРОСЫ, ничего не ломай.\n",
+         если данных не хватает, остановись, заполни раздел ВОПРОСЫ, ничего не ломай.",
         cwd.display()
-    ));
+    );
+    out.push_str(&match ctx {
+        BriefCtx::Cold => format!(
+            "{autonomy} У тебя нет истории этого проекта — контекст собери из файлов \
+             репозитория (graft, если есть — в приоритете).\n"
+        ),
+        BriefCtx::ProjectFork | BriefCtx::FollowUp => format!("{autonomy}\n"),
+    });
     out.push_str(
         "## Проверка\n\
          По ходу работы проверяй как обычно (сборка, точечные тесты). ФИНАЛЬНУЮ \
@@ -665,6 +732,10 @@ struct Job {
     /// The child's transient unit (`atlas-deleg-…`) in systemd spawn mode;
     /// `None` = plain direct spawn, the pre-systemd teardown applies.
     unit: Option<String>,
+    /// The rpc child's stdin, held past the turn so a status ping can steer
+    /// the live worker ([`request_status`]); `None` = closed — the watcher
+    /// takes it at `agent_end`, EOF makes the idle host exit.
+    stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
 }
 
 /// The newest job per item id (kept after it finishes so `/run` can still show
@@ -1071,11 +1142,7 @@ fn fork_session_file(src: &Path, old: &SessionHead, dest_dir: &Path) -> Result<P
 /// project) or the copy failed — the caller keeps today's fresh
 /// `--session-dir` spawn. The original session is never modified.
 fn fork_project_session(plan_cwd: &Path, dest_dir: &Path) -> Option<PathBuf> {
-    let root = cfg::sessions_dir();
-    let home = cfg::home();
-    let home = home.to_string_lossy();
-    let cwd = plan_cwd.to_string_lossy();
-    let (src, head) = find_project_session(&root, &home, &cwd)?;
+    let (src, head) = project_session(plan_cwd)?;
     match fork_session_file(&src, &head, dest_dir) {
         Ok(p) => {
             log::info!(
@@ -2000,13 +2067,19 @@ pub async fn preview(item_id: i64, target: Target) -> Result<Value, Error> {
         item.session.as_deref(),
         &run_session_path(item.id, &item.title, 0),
     );
+    // The start would fork a FRESH session when the project has one; the
+    // preview only probes for it (the fork itself copies — not a preview's
+    // job). A Resume here is always the STORED session → the run's own
+    // previous attempt.
+    let fork_would = matches!(session, omp_rpc::Session::Fresh(_))
+        && project_session(&plan.cwd).is_some();
     let resume = match &session {
         omp_rpc::Session::Resume(p) => Some(p.to_string_lossy().into_owned()),
         omp_rpc::Session::Fresh(_) => None,
     };
     Ok(json!({
         "ok": true,
-        "brief": compile_brief(item, &plan.cwd),
+        "brief": compile_brief(item, &plan.cwd, brief_ctx(&session, fork_would)),
         "cwd": plan.cwd.to_string_lossy(),
         // сессия, которую продолжит воркер (null — свежую)
         "resume": resume,
@@ -2080,7 +2153,6 @@ async fn start_process(
         project_checkout = Some(project_s);
     }
 
-    let brief = compile_brief(&item, &plan.cwd);
     // Fresh per-run session dir (the run's dossier folder): without a pin omp
     // continues the project's LATEST session (item 24 paid 223K tokens of
     // alien context for one flag). omp 18.9 mints fresh sessions inside a
@@ -2099,7 +2171,8 @@ async fn start_process(
     // (copy under a new id, resume by path): the worker starts from the
     // project's context, the original stays untouched. No project session —
     // today's fresh `--session-dir` spawn, resolver pins omp's file as before.
-    let session = if matches!(session, omp_rpc::Session::Fresh(_)) {
+    let fork_taken = matches!(session, omp_rpc::Session::Fresh(_));
+    let session = if fork_taken {
         match fork_project_session(&plan.cwd, &session_dir) {
             Some(p) => omp_rpc::Session::Resume(p),
             None => session,
@@ -2107,6 +2180,10 @@ async fn start_process(
     } else {
         session
     };
+    // The brief knows the session context: a fork of THIS start says «уже
+    // знаешь», a stored-session resume says «СВОЮ предыдущую попытку», a
+    // cold start assembles the context from the repository.
+    let brief = compile_brief(&item, &plan.cwd, brief_ctx(&session, fork_taken));
     let session_path = match &session {
         omp_rpc::Session::Resume(p) => p.to_string_lossy().into_owned(),
         omp_rpc::Session::Fresh(_) => String::new(),
@@ -2187,6 +2264,8 @@ async fn start_process(
             run: Arc::clone(&run),
             cancelled,
             unit,
+            // `omp -p` has no steerable stdin — nothing to hold open
+            stdin: Arc::new(Mutex::new(None)),
         }),
     );
     log::info!(
@@ -2216,7 +2295,6 @@ async fn start_process(
 /// the item goes to `review` and the idle child is torn down (SIGTERM), so rpc
 /// processes do not pile up.
 async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
-    let brief = compile_brief(&item, &plan.cwd);
     // Fresh per-run session by default (its own session dir — the run's
     // dossier folder, never the project's latest session). A true follow-up —
     // feedback exists AND the previous run's session file is recorded —
@@ -2235,7 +2313,8 @@ async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
     // (copy under a new id, resume by path): the worker starts from the
     // project's context, the original stays untouched. No project session —
     // today's fresh `--session-dir` spawn, resolver pins omp's file as before.
-    let session = if matches!(session, omp_rpc::Session::Fresh(_)) {
+    let fork_taken = matches!(session, omp_rpc::Session::Fresh(_));
+    let session = if fork_taken {
         match fork_project_session(&plan.cwd, &session_dir) {
             Some(p) => omp_rpc::Session::Resume(p),
             None => session,
@@ -2243,6 +2322,10 @@ async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
     } else {
         session
     };
+    // The brief knows the session context: a fork of THIS start says «уже
+    // знаешь», a stored-session resume says «СВОЮ предыдущую попытку», a
+    // cold start assembles the context from the repository.
+    let brief = compile_brief(&item, &plan.cwd, brief_ctx(&session, fork_taken));
     let session_path = match &session {
         omp_rpc::Session::Resume(p) => p.to_string_lossy().into_owned(),
         omp_rpc::Session::Fresh(_) => String::new(),
@@ -2322,6 +2405,9 @@ async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
     };
     let run = runner::Run::with_id(run_id, pid);
     let cancelled = Arc::new(AtomicBool::new(false));
+    // stdin survives `agent_end` until the watcher closes it, so a status
+    // ping can reach the live worker meanwhile (`request_status`).
+    let stdin_cell = Arc::new(Mutex::new(child.stdin.take()));
     let end_unit = unit.clone();
     put_job(
         item.id,
@@ -2329,6 +2415,7 @@ async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
             run: Arc::clone(&run),
             cancelled: Arc::clone(&cancelled),
             unit,
+            stdin: Arc::clone(&stdin_cell),
         }),
     );
     log::info!(
@@ -2402,7 +2489,6 @@ async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
     }
 
     let stdout = child.stdout.take().expect("piped stdout");
-    let mut stdin = child.stdin.take().expect("piped stdin");
     drop(child.stderr.take()); // model-retry noise; the ring carries the turn
     let frames = omp_rpc::Frames::spawn(stdout);
 
@@ -2411,6 +2497,7 @@ async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
     let watch_resume = resume.clone();
     let watch_ref = plan.reference.clone();
     let obs_r = Arc::clone(&obs);
+    let stdin_w = Arc::clone(&stdin_cell);
     std::thread::spawn(move || {
         let obs = obs_r;
         // stdin stays open for the whole turn — the rpc host treats EOF as a
@@ -2434,7 +2521,12 @@ async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
             }
         }
         let frame = json!({"type": "prompt", "message": brief});
-        let _ = omp_rpc::write_frame(&mut stdin, &frame);
+        {
+            let mut g = runner::lock(&stdin_w);
+            if let Some(s) = g.as_mut() {
+                let _ = omp_rpc::write_frame(s, &frame);
+            }
+        }
         run.push_line(match &watch_resume {
             Some(f) => format!("— продолжаю сессию проекта: {f} —"),
             None => "— ход запущен (свежая сессия) —".to_string(),
@@ -2450,7 +2542,7 @@ async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
                 break;
             }
         }
-        drop(stdin); // EOF → the idle rpc host exits
+        drop(runner::lock(&stdin_w).take()); // EOF → the idle rpc host exits
         if !mirror.partial.is_empty() {
             run.push_line(std::mem::take(&mut mirror.partial));
         }
@@ -2920,6 +3012,60 @@ fn worker_made_changes(dir: &Path, start: Option<&str>) -> bool {
             .unwrap_or(true),
         None => true, // no base — emptiness cannot be proven
     }
+}
+
+// ----------------------------------------------------------------- status ----
+
+/// The status question the owner's «?» button steers into a live rpc worker —
+/// short by design: the answer streams into the run ring like any other text.
+const STATUS_PROMPT: &str = "доложи кратко текущий статус по задаче";
+
+/// `POST …/delegate/status` — ask the RUNNING orchestrator worker for a brief
+/// status: a `steer` frame into the rpc child's stdin. The worker answers at
+/// the next step boundary of its live turn; the answer flows into the run
+/// ring as ordinary streamed text — no second `agent_end`, so the settle
+/// contract (review/needs-feedback/failed on the one terminal `agent_end`)
+/// stays untouched. Only an rpc delegation has a stdin to steer; the `omp -p`
+/// targets (worktree/dir) have no input channel after launch. A steer racing
+/// the final `agent_end` degrades harmlessly: the watcher closes stdin at the
+/// settle, EOF ends the idle host before a stray turn starts.
+pub async fn request_status(item_id: i64) -> Result<Value, Error> {
+    let Some(job) = job(item_id).filter(|j| j.run.active()) else {
+        return Err(Error::Busy("делегация не выполняется".to_string()));
+    };
+    // belt and braces over the job guard: a stale `running` row must not
+    // steer a corpse — only the rpc target ever had a stdin to hold.
+    let target: Option<String> = tokio::task::spawn_blocking(move || {
+        let conn = db::db_static().lock();
+        conn.query_row(
+            "SELECT delegation_target FROM items WHERE id=?1",
+            [item_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(None)
+    })
+    .await
+    .unwrap_or(None);
+    if target.as_deref() != Some("orchestrator") {
+        return Err(Error::Busy(
+            "статус можно запросить только у оркестратора".to_string(),
+        ));
+    }
+    let cell = Arc::clone(&job.stdin);
+    let frame = json!({"id": "status", "type": "steer", "message": STATUS_PROMPT});
+    let wrote = {
+        let mut g = runner::lock(&cell);
+        match g.as_mut() {
+            Some(s) => omp_rpc::write_frame(s, &frame).is_ok(),
+            None => false,
+        }
+    };
+    if !wrote {
+        return Err(Error::Busy("ход завершается — stdin уже закрыт".to_string()));
+    }
+    job.run.push_line("— запрошен статус у воркера —".to_string());
+    publish_run(item_id, "running");
+    Ok(json!({"ok": true}))
 }
 
 // ----------------------------------------------------------------- cancel ----
@@ -3440,13 +3586,15 @@ mod tests {
     #[test]
     fn brief_without_optional_sections() {
         let it = item();
-        let brief = compile_brief(&it, Path::new("/tmp/wt"));
+        let brief = compile_brief(&it, Path::new("/tmp/wt"), BriefCtx::Cold);
         assert_eq!(
             brief,
             "# починить сборку\n\
              релиз падает после обновления\n\
              Работай в каталоге /tmp/wt. Ты работаешь автономно: ответить на вопрос некому — \
-             если данных не хватает, остановись, заполни раздел ВОПРОСЫ, ничего не ломай.\n\
+             если данных не хватает, остановись, заполни раздел ВОПРОСЫ, ничего не ломай. \
+             У тебя нет истории этого проекта — контекст собери из файлов репозитория \
+             (graft, если есть — в приоритете).\n\
              ## Проверка\n\
              По ходу работы проверяй как обычно (сборка, точечные тесты). ФИНАЛЬНУЮ \
              верификацию воркер не гоняет — её при приёмке выполняет гейт atlas.\n\
@@ -3474,10 +3622,10 @@ mod tests {
     fn brief_falls_back_to_the_placeholder_description() {
         let mut it = item();
         it.description = None;
-        assert!(compile_brief(&it, Path::new("/p")).contains("\n(без описания)\n"));
+        assert!(compile_brief(&it, Path::new("/p"), BriefCtx::Cold).contains("\n(без описания)\n"));
         it.description = Some("   \n  ".into());
         assert!(
-            compile_brief(&it, Path::new("/p")).contains("\n(без описания)\n"),
+            compile_brief(&it, Path::new("/p"), BriefCtx::Cold).contains("\n(без описания)\n"),
             "blank descriptions are «(без описания)» too"
         );
     }
@@ -3492,7 +3640,7 @@ mod tests {
         ];
         it.files = vec!["/abs/Cargo.toml".into(), "/abs/two.rs".into()];
         it.feedback = Some("тесты не запускались".into());
-        let brief = compile_brief(&it, Path::new("/home/u/.atlas-wt/lamplife-7-ab12"));
+        let brief = compile_brief(&it, Path::new("/home/u/.atlas-wt/lamplife-7-ab12"), BriefCtx::Cold);
         assert!(
             brief.starts_with(
                 "# починить сборку\n\
@@ -3718,9 +3866,15 @@ mod tests {
     fn brief_points_at_graft_when_the_project_has_one() {
         let dir = std::env::temp_dir().join(format!("graft-brief-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("graft")).expect("mkdir graft");
-        let brief = compile_brief(&item(), &dir);
+        let brief = compile_brief(&item(), &dir, BriefCtx::Cold);
         assert!(brief.contains("В проекте есть graft/"), "{brief}");
         assert!(brief.contains("навык graft"), "{brief}");
+        // graft-ориентация — указание холодному воркеру: носитель истории
+        // (форк/продолжение) её не получает
+        let fork = compile_brief(&item(), &dir, BriefCtx::ProjectFork);
+        assert!(!fork.contains("В проекте есть graft/"), "{fork}");
+        let follow = compile_brief(&item(), &dir, BriefCtx::FollowUp);
+        assert!(!follow.contains("В проекте есть graft/"), "{follow}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3728,7 +3882,81 @@ mod tests {
     fn blank_feedback_is_dropped() {
         let mut it = item();
         it.feedback = Some("  \n ".into());
-        assert!(!compile_brief(&it, Path::new("/p")).contains("## Фидбек"));
+        assert!(!compile_brief(&it, Path::new("/p"), BriefCtx::Cold).contains("## Фидбек"));
+    }
+
+    /// The brief adapts to the session context: a fork of the project's
+    /// session says «уже знаешь», a follow-up says «СВОЮ предыдущую попытку»,
+    /// a cold start says «нет истории» — the markers never mix, the intro
+    /// precedes the description, the contract block stays identical.
+    #[test]
+    fn brief_matches_session_context() {
+        let it = item();
+        let cold = compile_brief(&it, Path::new("/p"), BriefCtx::Cold);
+        let fork = compile_brief(&it, Path::new("/p"), BriefCtx::ProjectFork);
+        let follow = compile_brief(&it, Path::new("/p"), BriefCtx::FollowUp);
+
+        assert!(fork.contains("уже знаешь"), "{fork}");
+        assert!(fork.contains("форк актуальной сессии"), "{fork}");
+        assert!(follow.contains("СВОЮ предыдущую попытку"), "{follow}");
+        assert!(cold.contains("У тебя нет истории этого проекта"), "{cold}");
+
+        // the markers never leak across modes
+        assert!(!cold.contains("уже знаешь"), "{cold}");
+        assert!(!cold.contains("СВОЮ предыдущую попытку"), "{cold}");
+        assert!(!fork.contains("нет истории"), "{fork}");
+        assert!(!follow.contains("нет истории"), "{follow}");
+
+        // the intro sits between the title and the description
+        let intro = fork.find("уже знаешь").unwrap();
+        assert!(fork.find("починить сборку\n").unwrap() < intro, "{fork}");
+        assert!(intro < fork.find("релиз падает").unwrap(), "{fork}");
+
+        // the Проверка/Итог contracts are identical in every mode
+        for b in [&cold, &fork, &follow] {
+            assert!(b.contains("## Проверка"), "{b}");
+            assert!(b.contains("## Итог (обязательно)"), "{b}");
+            assert!(b.ends_with("Вместо догадки — ВОПРОСЫ.\n"), "{b}");
+        }
+    }
+
+    /// The files header softens only when the worker carries history: cold
+    /// keeps «прочти перед работой», fork/follow-up ask to read only what the
+    /// context lacks.
+    #[test]
+    fn brief_files_header_softens_when_history_is_carried() {
+        let mut it = item();
+        it.files = vec!["/abs/Cargo.toml".into()];
+        let cold = compile_brief(&it, Path::new("/p"), BriefCtx::Cold);
+        assert!(cold.contains("## Файлы (прочти перед работой)\n"), "{cold}");
+        for b in [
+            compile_brief(&it, Path::new("/p"), BriefCtx::ProjectFork),
+            compile_brief(&it, Path::new("/p"), BriefCtx::FollowUp),
+        ] {
+            assert!(
+                b.contains("## Файлы (прочти, только если этого нет в контексте)\n"),
+                "{b}"
+            );
+            assert!(!b.contains("прочти перед работой"), "{b}");
+        }
+    }
+
+    /// The mode mapping: a fresh decision is Cold unless THIS start forked —
+    /// then the run resumes the fork copy (ProjectFork); a stored-session
+    /// resume is always the run's own previous attempt (FollowUp), even when
+    /// that stored file is a fork. The helper reads the POST-fork session.
+    #[test]
+    fn brief_ctx_reads_the_session_decision() {
+        let fresh = omp_rpc::Session::Fresh(PathBuf::from("/r/s.jsonl"));
+        let resumed = omp_rpc::Session::Resume(PathBuf::from("/r/own.jsonl"));
+        let fork_copy = omp_rpc::Session::Resume(PathBuf::from("/r/dossier/session.jsonl"));
+        assert_eq!(brief_ctx(&fresh, true), BriefCtx::Cold, "fork failed → cold");
+        assert_eq!(brief_ctx(&fresh, false), BriefCtx::Cold);
+        assert_eq!(brief_ctx(&fork_copy, true), BriefCtx::ProjectFork);
+        assert_eq!(brief_ctx(&resumed, false), BriefCtx::FollowUp);
+        // Resume + fork_taken=true never occurs in wiring: the flag is raised
+        // only when the decision was Fresh, so a Resume is either THIS
+        // start's fork copy or a stored resume — never both.
     }
 
     /// The slug must be stable for item+title and safe in a path and a git
@@ -4431,7 +4659,7 @@ mod tests {
         it.id = 999_000;
         it.project = Some(project.clone());
 
-        let brief = compile_brief(&it, Path::new("/p"));
+        let brief = compile_brief(&it, Path::new("/p"), BriefCtx::Cold);
         assert!(brief.contains("## Параллельная работа"), "{brief}");
         let section = &brief[brief.find("## Параллельная работа").unwrap()..];
         // newest first, the item's own final excluded → Б, А — never «сам»
@@ -4447,8 +4675,12 @@ mod tests {
 
         // no finished siblings → no section; no project → none either
         it.project = Some(format!("{project}-пусто"));
-        assert!(!compile_brief(&it, Path::new("/p")).contains("## Параллельная работа"));
+        assert!(
+            !compile_brief(&it, Path::new("/p"), BriefCtx::Cold).contains("## Параллельная работа")
+        );
         it.project = None;
-        assert!(!compile_brief(&it, Path::new("/p")).contains("## Параллельная работа"));
+        assert!(
+            !compile_brief(&it, Path::new("/p"), BriefCtx::Cold).contains("## Параллельная работа")
+        );
     }
 }

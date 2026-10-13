@@ -56,6 +56,7 @@ use clipboard::api_clipboard_image;
 use delegate_routes::{
     api_board_accept, api_board_reject, api_delegate_cancel, api_delegate_diff,
     api_delegate_preview, api_delegate_reset, api_delegate_run, api_delegate_start,
+    api_delegate_status,
 };
 use deps::api_deps;
 use focus::{api_focus, api_focus_targets, api_herdr, api_herdr_focus};
@@ -261,6 +262,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/board/item/{id}/delegate/cancel",
             post(api_delegate_cancel),
+        )
+        .route(
+            "/api/board/item/{id}/delegate/status",
+            post(api_delegate_status),
         )
         .route(
             "/api/board/item/{id}/delegate/reset",

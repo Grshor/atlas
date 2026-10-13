@@ -76,6 +76,14 @@ pub(crate) async fn api_delegate_cancel(uri: Uri) -> Result<Response, ApiError> 
     Ok(ok_json(delegate::cancel(id).await?))
 }
 
+/// POST /api/board/item/{id}/delegate/status — steer «доложи кратко текущий
+/// статус по задаче» into the running rpc worker; the answer streams into the
+/// live run journal. 409 for anything but a running orchestrator delegation.
+pub(crate) async fn api_delegate_status(uri: Uri) -> Result<Response, ApiError> {
+    let id = item_id_at(&uri, 2)?;
+    Ok(ok_json(delegate::request_status(id).await?))
+}
+
 /// GET /api/board/item/{id}/run — state + ring tail of the delegation run.
 pub(crate) async fn api_delegate_run(uri: Uri) -> Result<Response, ApiError> {
     let id = item_id_at(&uri, 1)?;
@@ -432,6 +440,36 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// POST …/delegate/status refuses everything that is not a LIVE rpc run:
+    /// unknown id, terminal/idle states, a non-rpc target, a `running` rpc row
+    /// whose job is gone (no real child in unit tests). The happy path needs a
+    /// real omp rpc child — live-verified on the dev instance.
+    #[tokio::test]
+    async fn delegate_status_refuses_everything_not_live_rpc() {
+        let r = test_router();
+        // unknown item: no live job → 409 «делегация не выполняется» (cancel's
+        // semantics, not the 404 of read verbs — nothing to read here)
+        let (st, _) = call(&r, "POST", "/api/board/item/999999/delegate/status", None).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        let id = seed_board_item("пинг статуса", Some("lamplife"), None);
+        for state in ["", "queued", "review", "needs-feedback", "failed"] {
+            set_delegation(id, state, Some("orchestrator"), Some("/tmp/nope"));
+            let (st, out) = call(&r, "POST", &format!("/api/board/item/{id}/delegate/status"), None).await;
+            assert_eq!(st, StatusCode::CONFLICT, "state={state}: {out}");
+        }
+        // running, but the `omp -p` targets have no input channel at all
+        set_delegation(id, "running", Some("dir"), Some("/tmp/nope"));
+        let (st, out) = call(&r, "POST", &format!("/api/board/item/{id}/delegate/status"), None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{out}");
+        // running rpc row, but this process holds no such job (restart case)
+        set_delegation(id, "running", Some("orchestrator"), Some("/tmp/nope"));
+        let (st, out) = call(&r, "POST", &format!("/api/board/item/{id}/delegate/status"), None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{out}");
+        // the refused pings wrote nothing into the row
+        let dg = board_delegation(&r, id).await;
+        assert_eq!(dg["state"], "running");
     }
 
     /// `GET …/run` mirrors the persisted state (an empty shape before the first

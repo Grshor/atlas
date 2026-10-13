@@ -102,6 +102,9 @@ button { font: inherit; color: var(--palette-foreground); }
   line-height: 1.5;
   cursor: pointer;
 }
+/* ❔ запросить статус у живого rpc-воркера: рядом с ⏳, ответ — в журнале */
+.mini.deleg-ask { color: var(--dim-fg); }
+.mini.deleg-ask:hover:not(:disabled) { color: var(--palette-accent); }
 /* пиктограммная кнопка (.ic): квадрат с глифом по центру; слово живёт в
    title/aria-label, журнал остаётся словесным */
 .btn95.ic, .mini.ic {

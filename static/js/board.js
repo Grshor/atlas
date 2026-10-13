@@ -244,6 +244,31 @@ function delegButton(it) {
     e.stopPropagation();
     if (busy) openDelegLog(it); else delegOpenTargets(it, b);
   });
+  /* живой оркестратор-воркер может доложить статус: steer-фрейм в его rpc
+     stdin, ответ идёт в тот же ход и виден в живом журнале (⏳). */
+  if (busy && it.delegation.target === 'orchestrator') {
+    const ask = el('button', 'mini deleg-ask', '❔');
+    ask.type = 'button';
+    ask.title = 'запросить статус';
+    ask.setAttribute('aria-label', ask.title);
+    ask.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      ask.disabled = true;
+      try {
+        await api('/api/board/item/' + it.id + '/delegate/status', jsonOpts('POST', {}));
+        log('✓ статус запрошен: ' + (it.title || it.id) + ' — ответ появится в живом журнале');
+        openDelegLog(it);
+      } catch (err) {
+        log('✗ статус не запрошен: ' + err.message);
+      } finally {
+        ask.disabled = false;
+      }
+    });
+    const frag = document.createDocumentFragment();
+    frag.appendChild(b);
+    frag.appendChild(ask);
+    return frag;
+  }
   return b;
 }
 /* пункты меню целей: worktree/каталог требуют проект; пока делегация идёт — всё выключено */
