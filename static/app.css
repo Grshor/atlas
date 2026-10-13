@@ -1132,6 +1132,29 @@ details.tasks > summary:hover { color: var(--palette-bright-foreground); }
 }
 .stt-hint.hidden { display: none !important; }
 
+/* ---------- горячая замена статики: плавающая плашка «интерфейс обновлён» ----
+   ФИКСИРОВАННАЯ над статус-строкой (как .stt-hint — display-переключение не
+   двигает раскладку), bevel-кнопка: клик = перезагрузка страницы. */
+.assets-chip {
+  position: fixed;
+  left: 12px;
+  bottom: 40px;
+  z-index: 95;
+  font: 10.5px/1.45 var(--font-mono);
+  color: var(--palette-accent);
+  text-align: left;
+  padding: 2px 7px;
+  cursor: pointer;
+  background: var(--palette-lighter-background);
+  border: 1px solid;
+  border-color: var(--bevel-hi) var(--bevel-lo) var(--bevel-lo) var(--bevel-hi);
+  box-shadow: 2px 2px 0 color-mix(in srgb, var(--palette-darker-background) 70%, transparent);
+}
+.assets-chip:hover {
+  border-color: var(--palette-accent) var(--bevel-lo) var(--bevel-lo) var(--palette-accent);
+  color: var(--palette-bright-foreground);
+}
+
 /* ---------- контекстное меню (ПКМ): тот же вид, что попап mkSelect ---------- */
 .ctxmenu { display: flex; min-width: 210px; max-width: 74vw; outline: none; }
 .ctxmenu-list { display: flex; flex-direction: column; min-width: 100%; }

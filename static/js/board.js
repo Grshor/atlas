@@ -118,6 +118,7 @@ function initBoardEvents() {
     alive = true;
     let m = null;
     try { m = JSON.parse(e.data); } catch (_) { return; }
+    if (m.type === 'assets') { assetsUpdated(); return; } /* статики коснулись — чип, перезагрузка только вручную */
     if (reviewLive && reviewLive.id === m.id && (m.type === 'run' || m.type === 'gate')) reviewLive.refresh();
     scheduleBoardRefresh();
   });
@@ -127,6 +128,36 @@ function initBoardEvents() {
     if (!alive) es.close();
   });
 }
+
+/* ---------- горячая замена статики: бэкенд смотрит на static/ на диске ----
+   Изменение ловится SSE-событием {type:"assets"}. Автоперезагрузки НЕТ: в
+   поля пишут — сюрприз-перезагрузка теряет набранное (черновики переживают
+   reload только у фидбек-полей). Вместо неё — чип: R/щелчок → location.reload().
+   Чип вешается на body (не в панель): вкладки переключаются, слушатель SSE
+   живёт один на страницу. */
+function assetsUpdated() {
+  log('интерфейс обновлён — R или клик по плашке — перезагрузка');
+  let chip = document.querySelector('.assets-chip');
+  if (chip) return; /* уже висит — не плодим */
+  chip = el('button', 'assets-chip', 'интерфейс обновлён — нажми R (или клик) для перезагрузки');
+  chip.type = 'button';
+  chip.title = 'статика панели изменилась на диске';
+  chip.addEventListener('click', () => location.reload());
+  document.body.appendChild(chip);
+}
+/* R (или р/к — русская раскладка) при висящем чипе перезагружает страницу,
+   а не обновляет панель: capture-фаза перехватывает раньше общего
+   обработчика app.js. В полях ввода и под оверлеями — как в app.js, не мешаем. */
+document.addEventListener('keydown', (e) => {
+  if (!document.querySelector('.assets-chip')) return;
+  if (/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement && document.activeElement.tagName || '')) return;
+  if (document.querySelector('.overlay')) return;
+  if (/^[rрк]$/i.test(e.key)) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    location.reload();
+  }
+}, true);
 
 const targetLabel = (v) => { const t = DELEG_TARGETS.find((x) => x.value === v); return t ? t.label : String(v || '?'); };
 const delegBusy = (dg) => !!(dg && (dg.state === 'queued' || dg.state === 'running'));

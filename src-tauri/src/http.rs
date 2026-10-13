@@ -9,4 +9,4 @@
 #[path = "web/mod.rs"]
 pub mod web;
 
-pub use web::{bind, serve, spawn_theme_watcher, AppState};
+pub use web::{bind, serve, spawn_assets_watcher, spawn_theme_watcher, AppState};

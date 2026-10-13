@@ -187,6 +187,7 @@ fn spawn_server_thread(port: u16) {
                     patrol::spawn();
                     delegate::spawn_autopilot();
                     http::spawn_theme_watcher();
+                    http::spawn_assets_watcher();
                     if let Err(e) = http::serve(listener, state).await {
                         log::error!("atlas server failed: {e}");
                     }
@@ -443,6 +444,7 @@ fn main() {
                     patrol::spawn();
                     delegate::spawn_autopilot();
                     http::spawn_theme_watcher();
+                    http::spawn_assets_watcher();
                     if let Err(e) = http::serve(listener, state).await {
                         log::error!("atlas server failed: {e}");
                         std::process::exit(1);

@@ -28,6 +28,7 @@ pub(crate) mod tasks;
 pub(crate) mod assets;
 
 pub use theme::spawn_theme_watcher;
+pub use assets::spawn_assets_watcher;
 
 #[cfg(test)]
 pub(crate) mod support;
