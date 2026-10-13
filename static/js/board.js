@@ -233,6 +233,26 @@ function delegOpenTargets(it, btn) {
   mkMenu(delegMenuItem(it), Math.round(r.left), Math.round(r.bottom + 2));
 }
 
+/* черновики фидбека провальных карточек: id дела → {open, text, caret, focus}.
+   Доска перерисовывается ЦЕЛИКОМ по любому SSE-событию (debounce 300 мс) и по
+   тику (10 с, пока что-то бежит) — открытая textarea «Возобновить» живёт в
+   старом DOM и без этого буфера исчезает вместе с набранным текстом на
+   следующем же событии. Запись заводится при рендере строки провала, правится
+   по input/раскрытию, удаляется при отправке (reject) либо когда дело больше
+   не в failed (pruneDelegFbDrafts на каждом renderBoard). */
+const delegFbDrafts = new Map();
+function pruneDelegFbDrafts(data) {
+  const live = new Set();
+  for (const [qk] of QUADS) {
+    for (const it of boardActive(data[qk])) {
+      if (it && it.delegation && it.delegation.state === 'failed') live.add(it.id);
+    }
+  }
+  for (const id of [...delegFbDrafts.keys()]) {
+    if (!live.has(id)) delegFbDrafts.delete(id);
+  }
+}
+
 /* провал → восстановление на карточке: «Возобновить» (главная) раскрывает
    фидбек — reject вернёт дело в queued, следующий preview покажет сессию
    провального хода (resume=…) и «отправить» продолжит её; «Повторить» —
@@ -251,12 +271,36 @@ function delegFailedRow(it) {
   rsend.type = 'button';
   rw.appendChild(rsend);
   row.appendChild(rw);
+  /* реинкарнация черновика: было открыто и/или набрано — восстанавливаем
+     (значение, каретка, фокус) вместо «схлопнуто и пусто» после перерисовки */
+  const draft = delegFbDrafts.get(it.id) || { open: false, text: '', caret: 0, focus: false };
+  delegFbDrafts.set(it.id, draft);
+  if (draft.open) {
+    rw.classList.remove('hidden');
+    ta.value = draft.text;
+  }
+  ta.addEventListener('input', () => {
+    draft.text = ta.value;
+    draft.caret = ta.selectionStart;
+  });
+  ta.addEventListener('focus', () => { draft.focus = true; });
+  /* Chrome шлёт blur ДО отвязки узла (isConnected ещё true), поэтому решаем
+     отложенно: если к следующему тику поле выкинуто из DOM — это перерисовка
+     доски, фокус «пережил» её и будет восстановлен; поле в документе — ушёл сам */
+  ta.addEventListener('blur', () => {
+    setTimeout(() => { if (ta.isConnected) draft.focus = false; }, 0);
+  });
   const resume = el('button', 'mini deleg-resume', 'Возобновить');
   resume.type = 'button';
   resume.title = 'вернуть с фидбеком — воркер продолжит свою сессию';
   resume.addEventListener('click', () => {
     rw.classList.toggle('hidden');
-    if (!rw.classList.contains('hidden')) ta.focus();
+    draft.open = !rw.classList.contains('hidden');
+    if (draft.open) {
+      ta.value = draft.text; /* поле могли пересобрать в свёрнутом виде — текст черновика вернём */
+      ta.focus();
+      draft.caret = ta.selectionStart;
+    }
   });
   row.appendChild(resume);
   const target = it.delegation && it.delegation.target;
@@ -267,12 +311,22 @@ function delegFailedRow(it) {
     retry.addEventListener('click', () => delegPreview(it, target));
     row.appendChild(retry);
   }
+  /* фокус пережил перерисовку (DOM заменён под курсором, blur не успел
+     сработать) — возвращаем его в новую textarea и ставим каретку на место;
+     queueMicrotask: к этому моменту карточка уже прицеплена к документу */
+  if (draft.focus) {
+    queueMicrotask(() => {
+      ta.focus();
+      try { ta.setSelectionRange(draft.caret, draft.caret); } catch (_) {}
+    });
+  }
   rsend.addEventListener('click', async () => {
     const fb = ta.value.trim();
     if (!fb) { ta.focus(); return; } /* фидбек обязателен — хоть «продолжай» */
     rsend.disabled = true;
     try {
       await api('/api/board/item/' + it.id + '/reject', jsonOpts('POST', { feedback: fb }));
+      delegFbDrafts.delete(it.id); /* отправлено — черновик больше не нужен */
       log('✓ возвращено с фидбеком: ' + (it.title || it.id));
       loadBoard();
       const t = (it.delegation && it.delegation.target) || null;
@@ -1092,6 +1146,7 @@ function renderBoardDone(items) {
 
 function renderBoard(data) {
   mselCloseOpen(); /* открытый список на карточке снимаем вместе со старыми карточками */
+  pruneDelegFbDrafts(data); /* дело вышло из failed → черновик фидбека долой */
   for (const [q] of QUADS) {
     const box = $('#cards-' + q);
     if (!box) continue;
