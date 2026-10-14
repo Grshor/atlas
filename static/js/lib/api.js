@@ -17,10 +17,25 @@ async function api(path, opts) {
   const timer = setTimeout(() => ctl.abort(), 8000);
   try {
     const res = await fetch(API + path, Object.assign({ signal: ctl.signal }, opts));
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) throw new Error(await errorText(res, opts && opts.reason));
     return await res.json();
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/* Текст ошибки fetch-обёртки: по умолчанию только «HTTP <code>» (старое
+   поведение всех вызовов); opts.reason:true — читает тело ответа и
+   подставляет причину сервера (поле detail), код — в скобках. */
+async function errorText(res, detailed) {
+  const code = 'HTTP ' + res.status;
+  if (!detailed) return code;
+  try {
+    const v = await res.json();
+    const m = v && v.detail;
+    return (typeof m === 'string' && m.trim()) ? m.trim() + ' (' + code + ')' : code;
+  } catch (_) {
+    return code;
   }
 }
 const jsonOpts = (method, body) => ({

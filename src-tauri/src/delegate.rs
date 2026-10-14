@@ -31,6 +31,12 @@
 //!   in the run ring, which the journal and the review dialog display.
 //! * `worktree` — `git -C <project> worktree add ~/.atlas-wt/<project>-<slug>
 //!   -b task/<slug>`, then a headless `omp -p "<brief>" --cwd <worktree>`.
+//!   A feedback-driven retry (the autopilot re-delegate, or a manual re-run
+//!   after reject) REUSES the previous attempt's tree when its
+//!   `.atlas-deleg.json` marker names the same item+project — that
+//!   continuation is the point of feedback, and the refusal loop
+//!   «ворктри уже существует» is gone. A foreign or unmarked dir is refused
+//!   exactly as before — atlas never touches what it cannot attribute.
 //! * `dir` — the same headless worker, directly in the project directory.
 //!
 //! Worker runs are in-process (like the make-task runner): the ring buffer
@@ -41,6 +47,19 @@
 //! asks `systemctl --user is-active` before settling an orphaned row; without
 //! systemd-run everything is a plain direct spawn and orphaned
 //! `queued`/`running` rows are marked `failed` on the next start, as before.
+//!
+//! `[delegation] run_in = "herdr"` (default `"systemd"` — prod behavior
+//! byte-identical) spawns the headless `omp -p` worker inside a DEDICATED
+//! herdr workspace/pane (`atlas-deleg-<slug>`, the same slug as the unit
+//! name): the owner watches the raw output live in a terminal, on the phone
+//! via the relay. The pane's shell types the command with an exit sentinel
+//! (`ATLAS_EXIT_<run>:$?`), the watcher polls it with `herdr pane
+//! wait-output`, and the atlas ring tails the tee'd dossier log as before.
+//! Cancel = SIGINT (`ctrl+c`) to the pane, 5 s grace, then `pane close`;
+//! `reap_stale` asks `pane process-info` (is the shell busy?) the same way
+//! `is-active` does for units; panes persist across atlas restarts exactly
+//! like units do. The orchestrator rpc child stays on systemd/direct — its
+//! rpc stdio is spoken by atlas, a pane tty cannot carry it.
 //!
 //! Safety: the worker is `omp -p` (headless) with no approval UI, so tool calls
 //! run unattended; only the guard's hard deny-rules (`~/.omp/agent/config.yml`:
@@ -645,6 +664,30 @@ fn write_deleg_marker(dir: &Path, item: i64, project: &str, branch: Option<&str>
     }
 }
 
+/// `(item id, project)` recorded in a worktree dir's `.atlas-deleg.json`
+/// marker; `None` when the marker is absent or unparsable — a foreign dir.
+fn worktree_owner(dir: &Path) -> Option<(i64, String)> {
+    let raw = std::fs::read_to_string(dir.join(DELEG_MARKER)).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    Some((
+        v["item"].as_i64()?,
+        v["project"].as_str()?.to_string(),
+    ))
+}
+
+/// The reuse decision for an existing worktree dir: `true` = its marker
+/// names THIS item and project, so the attempt is a feedback-driven retry
+/// (the autopilot re-delegate, or a manual re-run after reject) and it
+/// continues in the previous tree — the review diff measures against the
+/// new run's own start HEAD. `false` = foreign or unmarked: refuse, never
+/// touch a directory atlas cannot attribute.
+fn worktree_reusable(dir: &Path, item_id: i64, project: Option<&str>) -> bool {
+    match worktree_owner(dir) {
+        Some((id, owner)) => id == item_id && owner == project.unwrap_or(""),
+        None => false,
+    }
+}
+
 // ------------------------------------------------------------------ plan ----
 
 /// Where a delegation will work, resolved BEFORE anything is started (the
@@ -732,6 +775,9 @@ struct Job {
     /// The child's transient unit (`atlas-deleg-…`) in systemd spawn mode;
     /// `None` = plain direct spawn, the pre-systemd teardown applies.
     unit: Option<String>,
+    /// The worker's herdr pane in `run_in = "herdr"` mode — the cancel
+    /// surface (SIGINT + workspace close) instead of the unit/pid.
+    herdr: Option<HerdrWorker>,
     /// The rpc child's stdin, held past the turn so a status ping can steer
     /// the live worker ([`request_status`]); `None` = closed — the watcher
     /// takes it at `agent_end`, EOF makes the idle host exit.
@@ -817,6 +863,364 @@ fn spawn_unit_worker(
 fn new_unit(item_id: i64, title: &str) -> Option<String> {
     matches!(*omp_rpc::SPAWN_MODE, omp_rpc::SpawnMode::Systemd)
         .then(|| unit_name(item_id, title))
+}
+
+// ----------------------------------------------------------------- herdr ----
+
+/// Where the `omp -p` delegation worker is spawned: the default transient
+/// systemd unit, or a dedicated herdr workspace/pane the owner watches live
+/// (`[delegation] run_in`). The orchestrator rpc child never runs in a pane —
+/// its rpc stdio is spoken by atlas, a pane tty cannot carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunIn {
+    Systemd,
+    Herdr,
+}
+
+/// Pure config mapping: only the literal `herdr` (case-insensitive) leaves
+/// the systemd path. Anything else — a typo included — stays on it, so a
+/// bad config value can never silently change the spawn surface.
+fn run_in_of(s: &str) -> RunIn {
+    if s.eq_ignore_ascii_case("herdr") {
+        RunIn::Herdr
+    } else {
+        RunIn::Systemd
+    }
+}
+
+fn run_in() -> RunIn {
+    run_in_of(&cfg::config().delegation_run_in)
+}
+
+/// The herdr pane identity of one delegation worker: the dedicated workspace
+/// and its root pane, both alive while the worker runs.
+#[derive(Debug, Clone)]
+struct HerdrWorker {
+    workspace: String,
+    pane: String,
+}
+
+/// POSIX single-quote escaping for a `herdr pane run` command line. The pane
+/// shell reads the text verbatim, so each argv element must survive as ONE
+/// word — spaces, quotes, `$` and newlines included: a brief is arbitrary
+/// text and must never execute mid-word.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The full `pane run` command line for one worker: the omp invocation with
+/// output teed into the run dossier (the atlas ring tails that file — the
+/// same live журнал as the unit mode's piped stdout; the pane itself shows
+/// the same bytes to the owner), then the exit sentinel `echo
+/// ATLAS_EXIT_<run>:$?`. The sentinel regex cannot match the ECHOED command
+/// line — the typed text carries the literal `$?`, only the real output line
+/// carries the number — so the watcher fires exactly once, on the exit.
+fn pane_command_text(run_id: i64, argv: &[String], log: &Path) -> String {
+    let mut cmd = argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ");
+    cmd.push_str(&format!(
+        " > >(tee -a {}) 2>&1; echo ATLAS_EXIT_{run_id}:$?",
+        sh_quote(&log.to_string_lossy())
+    ));
+    cmd
+}
+
+/// One `herdr` CLI call: `(exit code, stdout, stderr)`. The CLI answers with
+/// JSON on stdout (success) or stderr (API error, rc 1); rc 2 is a syntax
+/// error and means atlas and herdr disagree — logged at the caller.
+fn herdr_call(args: &[&str]) -> (i32, String, String) {
+    match std::process::Command::new(cfg::HERDR_BIN.as_str())
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Ok(out) => (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ),
+        Err(e) => (-1, String::new(), e.to_string()),
+    }
+}
+
+fn herdr_json(args: &[&str]) -> Option<Value> {
+    let (code, out, err) = herdr_call(args);
+    if code != 0 {
+        log::debug!("delegate: herdr {} failed ({code}): {}", args.join(" "), err.trim());
+        return None;
+    }
+    serde_json::from_str(&out).ok()
+}
+
+/// Create the worker's dedicated workspace (own tab, root shell pane) in the
+/// default herdr session — headlessly, no attached client needed.
+/// `--no-focus` never steals the owner's keyboard.
+fn herdr_workspace_create(label: &str, cwd: &Path) -> std::io::Result<HerdrWorker> {
+    let cwd_s = cwd.to_string_lossy().into_owned();
+    let parse = |what: &str| std::io::Error::other(format!("herdr: нет {what} в ответе"));
+    let v = herdr_json(&[
+        "workspace",
+        "create",
+        "--label",
+        label,
+        "--cwd",
+        &cwd_s,
+        "--no-focus",
+    ])
+    .ok_or_else(|| std::io::Error::other(format!("herdr workspace create {label} failed")))?;
+    let r = &v["result"];
+    let ws = r["workspace"]["workspace_id"]
+        .as_str()
+        .ok_or_else(|| parse("workspace_id"))?
+        .to_string();
+    let pane = r["root_pane"]["pane_id"]
+        .as_str()
+        .ok_or_else(|| parse("pane_id"))?
+        .to_string();
+    Ok(HerdrWorker { workspace: ws, pane })
+}
+
+/// Is the pane's shell busy with the worker (the herdr twin of `systemctl
+/// --user is-active`)? `herdr pane process-info` reports the foreground
+/// process group: at an idle prompt it equals the shell pid, while a command
+/// runs it is the command's own group. `None` = the pane is gone / no answer.
+fn herdr_pane_busy(pane: &str) -> Option<bool> {
+    let v = herdr_json(&["pane", "process-info", "--pane", pane])?;
+    let pi = &v["result"]["process_info"];
+    let fgp = pi["foreground_process_group_id"].as_u64()?;
+    let shell = pi["shell_pid"].as_u64()?;
+    Some(fgp != shell)
+}
+
+/// The watcher's exit probe: `herdr pane wait-output` with the run's
+/// sentinel regex. `None` = keep polling (timeout or a transient CLI
+/// failure); `Some(None)` = the pane is gone (cancel or a herdr shutdown);
+/// `Some(Some(code))` = the worker exited with `code` (parsed from the
+/// sentinel line; `-1` when the number is missing).
+fn herdr_wait_exit(pane: &str, regex: &str, timeout_ms: u64) -> Option<Option<i32>> {
+    let tmo = timeout_ms.to_string();
+    let (code, out, err) = herdr_call(&[
+        "pane",
+        "wait-output",
+        pane,
+        "--regex",
+        regex,
+        "--timeout",
+        &tmo,
+    ]);
+    if code != 0 {
+        // pane_not_found is final; anything else may be transient
+        return if err.contains("pane_not_found") {
+            Some(None)
+        } else {
+            None
+        };
+    }
+    let v: Value = serde_json::from_str(&out).ok()?;
+    let line = v["result"]["matched_line"].as_str().unwrap_or("");
+    Some(Some(parse_exit_line(line)))
+}
+
+/// `…ATLAS_EXIT_<run>:<code>` → `<code>`; anything unparsable → `-1` — an
+/// unreadable exit is a failure, not a guess.
+fn parse_exit_line(line: &str) -> i32 {
+    let num = line.rsplit(':').next().unwrap_or("").trim();
+    if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+        num.parse().unwrap_or(-1)
+    } else {
+        -1
+    }
+}
+
+/// Close the worker's workspace (root pane close takes it down): herdr kills
+/// the whole process group — the force step of the herdr teardown.
+fn herdr_workspace_close(workspace: &str) {
+    let _ = herdr_call(&["workspace", "close", workspace]);
+}
+
+/// SIGINT to the pane's foreground process group — the graceful step (the
+/// `systemctl stop` SIGTERM twin): the worker gets to flush and die.
+fn herdr_pane_interrupt(pane: &str) {
+    let _ = herdr_call(&["pane", "send-keys", pane, "ctrl+c"]);
+}
+
+/// Find the worker's workspace by its stable label (`reap_stale`'s
+/// is-active twin): `(workspace_id, pane_id)` when it exists.
+fn herdr_workspace_by_label(label: &str) -> Option<(String, String)> {
+    let v = herdr_json(&["workspace", "list"])?;
+    for ws in v["result"]["workspaces"].as_array()? {
+        if ws["label"].as_str() == Some(label) {
+            let id = ws["workspace_id"].as_str()?.to_string();
+            let panes = herdr_json(&["pane", "list", "--workspace", &id])?;
+            let pane = panes["result"]["panes"]
+                .get(0)?
+                .get("pane_id")?
+                .as_str()?
+                .to_string();
+            return Some((id, pane));
+        }
+    }
+    None
+}
+
+/// reap_stale's herdr probe: `true` when the labeled workspace still runs a
+/// busy pane (the worker outlived the atlas restart — leave the row alone).
+/// A leftover IDLE workspace (the watcher died mid-flight) is closed here, so
+/// no dead panes pile up in the owner's herdr. No answer counts as gone:
+/// panes are server children, a dead herdr took the worker with it.
+fn herdr_reap_label(label: &str) -> bool {
+    let Some((ws, pane)) = herdr_workspace_by_label(label) else {
+        return false;
+    };
+    match herdr_pane_busy(&pane) {
+        Some(true) => true,
+        _ => {
+            herdr_workspace_close(&ws);
+            false
+        }
+    }
+}
+
+/// The herdr teardown: SIGINT to the worker (the SIGTERM twin), wait out the
+/// grace while the run is still active, then close the workspace — herdr
+/// kills the whole process group, grandchildren included.
+fn herdr_stop_worker(hw: &HerdrWorker, alive: impl Fn() -> bool, grace: Duration) {
+    herdr_pane_interrupt(&hw.pane);
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline && alive() {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    herdr_workspace_close(&hw.workspace);
+}
+
+/// The herdr toast body of a settled delegation: «Дело 13 Add discount:
+/// review — готово к ревью». The ring/notification text rides in with the
+/// «делегация дела N: …» prefix — strip it (the body already names the
+/// item); anything else passes whole. Single line, capped at 200 chars.
+fn toast_body(item_id: i64, title: &str, state: &str, text: &str) -> String {
+    let short = text
+        .strip_prefix(&format!("делегация дела {item_id}: "))
+        .unwrap_or(text);
+    let mut body = format!("Дело {item_id} {title}: {state} — {short}");
+    if let Some(i) = body.find('\n') {
+        body.truncate(i);
+    }
+    if body.chars().count() > 200 {
+        body = body.chars().take(200).collect::<String>() + "…";
+    }
+    body
+}
+
+/// Best-effort herdr toast (`[delegation] herdr_toasts`): a detached thread
+/// calls `herdr notification show atlas --body …` — argv only, no shell;
+/// never blocks the caller, never fails it. herdr down / the CLI missing /
+/// the flag off are all silent no-ops.
+fn herdr_notify(body: &str) {
+    if !cfg::config().delegation_herdr_toasts {
+        return;
+    }
+    let body = body.to_string();
+    let _ = std::thread::Builder::new()
+        .name("herdr-toast".into())
+        .spawn(move || {
+            let (code, out, err) = herdr_call(&["notification", "show", "atlas", "--body", &body]);
+            if code != 0 {
+                log::debug!("delegate: herdr toast не показан ({code}): {}", err.trim());
+            } else {
+                log::info!("delegate: herdr toast отправлен: {body}");
+            }
+            let _ = out;
+        });
+}
+
+/// The herdr twin of [`spawn_unit_worker`]: create the dedicated workspace,
+/// type the worker command into its pane, wire the ring readers (tail -F on
+/// the teed dossier log) + the exit watcher. The watcher polls the pane for
+/// the `ATLAS_EXIT_<run>` sentinel, then closes the workspace and settles
+/// the run exactly as the unit watcher does. Returns the run handle plus the
+/// pane identity for the Job (cancel) — a failed create/`pane run` leaves
+/// nothing behind.
+fn spawn_herdr_worker(
+    label: &str,
+    run_id: i64,
+    argv: &[String],
+    cwd: &Path,
+    log: &Path,
+    on_exit: impl FnOnce(i32) + Send + 'static,
+) -> std::io::Result<(Arc<runner::Run>, HerdrWorker)> {
+    let hw = herdr_workspace_create(label, cwd)?;
+    let text = pane_command_text(run_id, argv, log);
+    let pane = hw.pane.clone();
+    let (code, _out, err) = herdr_call(&["pane", "run", &pane, &text]);
+    if code != 0 {
+        herdr_workspace_close(&hw.workspace);
+        return Err(std::io::Error::other(format!(
+            "herdr pane run не принят: {}",
+            err.trim()
+        )));
+    }
+    let mut tail = std::process::Command::new("tail")
+        .args(["-n", "+1", "-F"])
+        .arg(log)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    // Best-effort worker pid for the logs (the pane's foreground group once
+    // the worker exec'd); 0 = not resolved in time — the herdr cancel path
+    // never uses a pid, the pane is the kill surface.
+    let pid = poll_until(
+        10,
+        Duration::from_millis(200),
+        std::thread::sleep,
+        || match herdr_pane_busy(&pane) {
+            Some(true) => herdr_json(&["pane", "process-info", "--pane", &pane])
+                .and_then(|v| {
+                    v["result"]["process_info"]["foreground_process_group_id"].as_u64()
+                })
+                .map(|p| p as u32),
+            _ => None,
+        },
+    )
+    .unwrap_or(0);
+    let run = runner::Run::with_id(run_id, pid);
+    if let Some(out) = tail.stdout.take() {
+        runner::spawn_reader(out, Arc::clone(&run));
+    }
+    run.push_line(format!(
+        "— herdr панель {pane} (рабочее пространство {label}) —"
+    ));
+    let ws = hw.workspace.clone();
+    let regex = format!("ATLAS_EXIT_{run_id}:[0-9]+");
+    let monitored = Arc::clone(&run);
+    std::thread::spawn(move || {
+        let mut exit = -1;
+        let mut flaky = 0; // consecutive unanswered probes (herdr server gone)
+        loop {
+            match herdr_wait_exit(&pane, &regex, 30_000) {
+                Some(Some(c)) => {
+                    exit = c;
+                    break;
+                }
+                Some(None) => break, // pane closed: cancel or herdr shutdown
+                None => match herdr_pane_busy(&pane) {
+                    Some(true) => flaky = 0, // worker alive, keep waiting
+                    Some(false) => break,    // prompt back, sentinel never came
+                    None => {
+                        flaky += 1;
+                        if flaky >= 4 {
+                            break;
+                        }
+                    }
+                },
+            }
+        }
+        let _ = tail.kill();
+        let _ = tail.wait();
+        herdr_workspace_close(&ws);
+        monitored.finish(exit);
+        on_exit(exit);
+    });
+    Ok((run, hw))
 }
 
 /// The session pin for one delegation run. FRESH by default — its own
@@ -2088,6 +2492,14 @@ pub async fn preview(item_id: i64, target: Target) -> Result<Value, Error> {
 
 // ------------------------------------------------------------------ start ----
 
+/// A refused delegation start: one INFO line with the exact reason (the
+/// 14:26 press-storm left no trace anywhere — refusals were silent 409s),
+/// then the unchanged 409 body.
+fn refused(item_id: i64, reason: String) -> Error {
+    log::info!("delegate: делегация дела {item_id} отклонена: {reason}");
+    Error::Busy(reason)
+}
+
 /// `POST …/delegate` — start one delegation of `item_id` to `target`.
 pub async fn start(item_id: i64, target: Target) -> Result<Value, Error> {
     let loaded = load_bg(item_id).await?;
@@ -2095,16 +2507,18 @@ pub async fn start(item_id: i64, target: Target) -> Result<Value, Error> {
     // that IS the feedback loop: reject → фидбек → следующий бриф. Only a
     // live run and an unanswered question block a start.
     if loaded.item.state == "running" {
-        return Err(Error::Busy(format!(
-            "дело {item_id} уже делегировано (состояние 'running')"
-        )));
+        return Err(refused(
+            item_id,
+            format!("дело {item_id} уже делегировано (состояние 'running')"),
+        ));
     }
     // questions still wait for an answer: re-delegation goes through
     // reject (the feedback lands in the next brief's «Фидбек» section)
     if loaded.item.state == "needs-feedback" {
-        return Err(Error::Busy(format!(
-            "дело {item_id}: воркер ждёт ответа на вопросы — верни с фидбеком (reject)"
-        )));
+        return Err(refused(
+            item_id,
+            format!("дело {item_id}: воркер ждёт ответа на вопросы — верни с фидбеком (reject)"),
+        ));
     }
     let plan = plan(target, &loaded)?;
     match target {
@@ -2123,34 +2537,48 @@ async fn start_process(
 ) -> Result<Value, Error> {
     let mut project_checkout = None;
     if worktree {
-        if plan.cwd.exists() {
-            return Err(Error::Busy(format!(
-                "ворктри уже существует: {}",
-                plan.cwd.display()
-            )));
-        }
         let project = plan
             .project_path
             .clone()
             .ok_or_else(|| no_path(&item, target))?;
-        if let Some(parent) = plan.cwd.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::Io(format!("{}: {e}", parent.display())))?;
+        if plan.cwd.exists() {
+            // A tree from a previous attempt: when its marker names THIS
+            // item+project, the attempt is a feedback-driven retry (the
+            // autopilot re-delegate, or a manual re-run after reject) and it
+            // continues in the same tree — that continuation is the point of
+            // feedback. A foreign or unmarked dir is never touched.
+            if !worktree_reusable(&plan.cwd, item.id, item.project.as_deref()) {
+                return Err(refused(
+                    item.id,
+                    format!("ворктри уже существует: {}", plan.cwd.display()),
+                ));
+            }
+            log::info!(
+                "delegate: item {} → повтор в существующем ворктри {}",
+                item.id,
+                plan.cwd.display()
+            );
+        } else {
+            if let Some(parent) = plan.cwd.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| Error::Io(format!("{}: {e}", parent.display())))?;
+            }
+            let branch = plan.branch.clone().expect("worktree plan carries a branch");
+            let project_s = project.to_string_lossy().into_owned();
+            let dir_s = plan.cwd.to_string_lossy().into_owned();
+            let (ok, out) =
+                git(&["-C", &project_s, "worktree", "add", &dir_s, "-b", &branch], 60).await;
+            if !ok {
+                return Err(Error::Bad(format!("git worktree add: {out}")));
+            }
+            write_deleg_marker(
+                &plan.cwd,
+                item.id,
+                item.project.as_deref().unwrap_or(""),
+                plan.branch.as_deref(),
+            );
         }
-        let branch = plan.branch.clone().expect("worktree plan carries a branch");
-        let project_s = project.to_string_lossy().into_owned();
-        let dir_s = plan.cwd.to_string_lossy().into_owned();
-        let (ok, out) = git(&["-C", &project_s, "worktree", "add", &dir_s, "-b", &branch], 60).await;
-        if !ok {
-            return Err(Error::Bad(format!("git worktree add: {out}")));
-        }
-        write_deleg_marker(
-            &plan.cwd,
-            item.id,
-            item.project.as_deref().unwrap_or(""),
-            plan.branch.as_deref(),
-        );
-        project_checkout = Some(project_s);
+        project_checkout = Some(project.to_string_lossy().into_owned());
     }
 
     // Fresh per-run session dir (the run's dossier folder): without a pin omp
@@ -2204,10 +2632,17 @@ async fn start_process(
         "--cwd".to_string(),
         plan.cwd.to_string_lossy().into_owned(),
     ]);
-    let unit = new_unit(item.id, &item.title);
+    // run_in = "herdr" sends the worker to a herdr pane (no unit); otherwise
+    // exactly the systemd-unit/direct choice as before.
+    let herdr_mode = run_in() == RunIn::Herdr;
+    let unit = if herdr_mode {
+        None
+    } else {
+        new_unit(item.id, &item.title)
+    };
     let argv = match &unit {
         Some(u) => omp_rpc::systemd_run_argv(u, &omp_argv),
-        None => omp_argv,
+        None => omp_argv.clone(),
     };
     let cancelled = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&cancelled);
@@ -2240,23 +2675,57 @@ async fn start_process(
         settle_spawn_failed(id, project.as_deref(), &e);
         Error::Io(e)
     };
-    let run = match &unit {
-        Some(u) => spawn_unit_worker(u, run_id, &argv, &plan.cwd, move |code| {
-            on_process_exit(id, project_for_exit.as_deref(), code, &flag);
+    let spawned = if herdr_mode {
+        let pane_log = runs_dir(id, run_id).join("pane-output.log");
+        // herdr CLI calls are blocking — `workspace create`, `pane run` and
+        // the pid `poll_until` (up to 10×200 ms of sleeps on the happy path,
+        // a hung `herdr` daemon is unbounded) run inside this async handler.
+        // On the blocking pool they can stall a pool thread, never a runtime
+        // worker — the board/health endpoints stay responsive during a spawn.
+        let label = unit_name(item.id, &item.title);
+        let cwd = plan.cwd.clone();
+        tokio::task::spawn_blocking(move || {
+            spawn_herdr_worker(
+                &label,
+                run_id,
+                &argv,
+                &cwd,
+                &pane_log,
+                move |code| {
+                    on_process_exit(id, project_for_exit.as_deref(), code, &flag);
+                },
+            )
         })
-        .map_err(|e| spawn_err(format!("не удалось запустить omp (юнит {u}): {e}")))?,
-        None => runner::spawn_with_id(run_id, &argv, &plan.cwd, move |code| {
-            on_process_exit(id, project_for_exit.as_deref(), code, &flag);
-        })
-        .map_err(|e| spawn_err(format!("не удалось запустить omp: {e}")))?,
+        .await
+        .map_err(|e| {
+            spawn_err(format!("не удалось запустить omp в herdr-панели: {e}"))
+        })?
+        .map(|(r, hw)| (r, Some(hw)))
+        .map_err(|e| {
+            spawn_err(format!("не удалось запустить omp в herdr-панели: {e}"))
+        })?
+    } else {
+        let run = match &unit {
+            Some(u) => spawn_unit_worker(u, run_id, &argv, &plan.cwd, move |code| {
+                on_process_exit(id, project_for_exit.as_deref(), code, &flag);
+            })
+            .map_err(|e| spawn_err(format!("не удалось запустить omp (юнит {u}): {e}")))?,
+            None => runner::spawn_with_id(run_id, &argv, &plan.cwd, move |code| {
+                on_process_exit(id, project_for_exit.as_deref(), code, &flag);
+            })
+            .map_err(|e| spawn_err(format!("не удалось запустить omp: {e}")))?,
+        };
+        (run, None)
     };
+    let (run, herdr_worker) = spawned;
     debug_assert_eq!(run.id, run_id, "spawn must adopt the pre-reserved run id");
     if matches!(session, omp_rpc::Session::Fresh(_)) {
         spawn_session_resolver(id, run_id, session_dir, spawned_at);
     }
-    let unit_mark = match &unit {
-        Some(u) => format!(" [unit {u}]"),
-        None => String::new(),
+    let unit_mark = match (&unit, &herdr_worker) {
+        (Some(u), _) => format!(" [unit {u}]"),
+        (None, Some(hw)) => format!(" [herdr {}:{}]", hw.workspace, hw.pane),
+        (None, None) => String::new(),
     };
     put_job(
         item.id,
@@ -2264,6 +2733,7 @@ async fn start_process(
             run: Arc::clone(&run),
             cancelled,
             unit,
+            herdr: herdr_worker,
             // `omp -p` has no steerable stdin — nothing to hold open
             stdin: Arc::new(Mutex::new(None)),
         }),
@@ -2415,6 +2885,9 @@ async fn start_orchestrator(item: Item, plan: Plan) -> Result<Value, Error> {
             run: Arc::clone(&run),
             cancelled: Arc::clone(&cancelled),
             unit,
+            // the rpc child speaks its protocol over stdio with atlas — it
+            // can never live in a herdr pane, whose tty owns both ends
+            herdr: None,
             stdin: Arc::clone(&stdin_cell),
         }),
     );
@@ -3103,7 +3576,15 @@ fn settle_terminal(
     if let Err(e) = db::insert_notification(&conn, level, project, &text) {
         log::warn!("delegate: turn notification failed: {e}");
     }
+    // the herdr twin of the bell row: «Дело N <title>: <state> — <причина>»
+    // (needs-feedback included — its question text flows through here)
+    let title: Option<String> = conn
+        .query_row("SELECT title FROM items WHERE id=?1", [item_id], |r| r.get(0))
+        .ok();
     drop(conn);
+    if let Some(t) = title {
+        herdr_notify(&toast_body(item_id, &t, state, &text));
+    }
     publish_run(item_id, state);
     // Run dossier as files (EAC gate-log pattern): the columns above are the
     // review-card showcase, the directory is the full dossier. The run id
@@ -3302,9 +3783,11 @@ pub async fn request_status(item_id: i64) -> Result<Value, Error> {
 // ----------------------------------------------------------------- cancel ----
 
 /// `POST …/delegate/cancel` — stop the worker or the delegation's rpc child:
-/// `systemctl --user stop` for a transient-unit child (SIGTERM to the whole
-/// cgroup, grandchildren included) or a bare SIGTERM otherwise — SIGKILL
-/// after the grace in both modes — and settle the item as `failed`.
+/// a herdr-pane worker gets SIGINT (ctrl+c) and, after the grace, the
+/// workspace close (herdr kills the whole process group); `systemctl --user
+/// stop` for a transient-unit child (SIGTERM to the whole cgroup,
+/// grandchildren included) or a bare SIGTERM otherwise — SIGKILL after the
+/// grace in both modes — and settle the item as `failed`.
 pub async fn cancel(item_id: i64) -> Result<Value, Error> {
     let Some(job) = job(item_id).filter(|j| j.run.active()) else {
         return Err(Error::Busy("ничего не выполняется".to_string()));
@@ -3315,9 +3798,13 @@ pub async fn cancel(item_id: i64) -> Result<Value, Error> {
     let run = Arc::clone(&job.run);
     // the tail outlives the in-memory ring (a restart must not erase it)
     let tail = tail_json(&run.tail_lines(TAIL_LINES));
-    tokio::task::spawn_blocking(move || match unit.as_deref() {
-        Some(u) => omp_rpc::stop_unit_graceful(u, pid, || run.active(), KILL_GRACE),
-        None => omp_rpc::kill_graceful(pid, || run.active(), KILL_GRACE),
+    let herdr = job.herdr.clone();
+    tokio::task::spawn_blocking(move || match (unit.as_deref(), herdr) {
+        // herdr worker: SIGINT to the pane, grace, then close the workspace
+        // — herdr kills the whole process group, grandchildren included
+        (_, Some(hw)) => herdr_stop_worker(&hw, || run.active(), KILL_GRACE),
+        (Some(u), None) => omp_rpc::stop_unit_graceful(u, pid, || run.active(), KILL_GRACE),
+        (None, None) => omp_rpc::kill_graceful(pid, || run.active(), KILL_GRACE),
     });
     // close the ring here so /run stops reporting "active" at once
     job.run.finish(-1);
@@ -3759,10 +4246,17 @@ pub fn reap_stale() {
     let mut reaped: Vec<i64> = Vec::new();
     let mut live: usize = 0;
     for (id, title) in &stale {
+        let label = unit_name(*id, title);
         if mode == omp_rpc::SpawnMode::Systemd
-            && omp_rpc::unit_is_active(&unit_name(*id, title)) == Some(true)
+            && omp_rpc::unit_is_active(&label) == Some(true)
         {
             live += 1; // the worker outlived the server in this session
+            continue;
+        }
+        // run_in = "herdr": the same question to the labeled pane (is the
+        // shell busy?); a leftover idle workspace is closed with the row
+        if herdr_reap_label(&label) {
+            live += 1;
             continue;
         }
         reaped.push(*id);
@@ -3782,7 +4276,7 @@ pub fn reap_stale() {
     );
     if live > 0 {
         text.push_str(&format!(
-            "; ещё {live} воркер(ов) живы в systemd-юнитах atlas-deleg-*"
+            "; ещё {live} воркер(ов) живы (atlas-deleg-*: юнит или herdr-панель)"
         ));
     }
     let _ = db::insert_notification(&conn, "warn", None, &text);
@@ -4230,6 +4724,120 @@ mod tests {
         assert_eq!(a["atlas-deleg-7-".len()..].len(), 4, "hash4 suffix: {a}");
         assert!(a.is_ascii(), "ascii only: {a}");
         assert!(!a.contains(['/', ' ']), "no slashes or spaces: {a}");
+    }
+
+    /// The herdr toast body: item+title+state with the reason riding in
+    /// from the notification text minus its «делегация дела N:» prefix —
+    /// single line, capped at 200 chars.
+    #[test]
+    fn toast_body_names_item_and_strips_the_prefix() {
+        assert_eq!(
+            toast_body(13, "Add discount", "review", "делегация дела 13: готово к ревью"),
+            "Дело 13 Add discount: review — готово к ревью"
+        );
+        assert_eq!(
+            toast_body(
+                13,
+                "Add discount",
+                "needs-feedback",
+                "делегация дела 13: воркер задал вопросы — ответь через «вернуть с фидбеком»"
+            ),
+            "Дело 13 Add discount: needs-feedback — воркер задал вопросы — ответь через «вернуть с фидбеком»"
+        );
+        assert_eq!(
+            toast_body(7, "дело", "failed", "воркер ничего не сделал"),
+            "Дело 7 дело: failed — воркер ничего не сделал",
+            "no prefix → the text passes whole"
+        );
+        let long = toast_body(1, "t", "review", &"x".repeat(500));
+        assert_eq!(long.chars().count(), 201, "200 chars + the ellipsis");
+        assert!(long.ends_with('…'));
+        assert!(!toast_body(1, "t", "review", "строка1\nстрока2").contains('\n'), "single line");
+    }
+
+    /// `[delegation] run_in`: only the literal `herdr` leaves the systemd
+    /// path — anything else, garbage included, stays on it (a bad config
+    /// value can never silently change the spawn surface).
+    #[test]
+    fn run_in_maps_only_literal_herdr() {
+        assert_eq!(run_in_of("herdr"), RunIn::Herdr);
+        assert_eq!(run_in_of("HERDR"), RunIn::Herdr, "case-insensitive");
+        assert_eq!(run_in_of("systemd"), RunIn::Systemd);
+        assert_eq!(run_in_of(""), RunIn::Systemd, "the default key value");
+        assert_eq!(run_in_of("herd"), RunIn::Systemd, "no prefix matches");
+        assert_eq!(run_in_of("в herdr"), RunIn::Systemd, "garbage → systemd");
+    }
+
+    /// The `pane run` command line quotes every argv element as ONE shell
+    /// word — a brief is arbitrary text (quotes, `$`, newlines) and must
+    /// never execute mid-word — and appends the exit sentinel whose regex
+    /// can only match the OUTPUT line, never the echoed typed command.
+    #[test]
+    fn pane_command_quotes_argv_and_appends_sentinel() {
+        let argv = vec!["omp".to_string(), "-p".to_string(), "в Brief' ${x}; rm".to_string()];
+        let cmd = pane_command_text(42, &argv, Path::new("/tmp/d/42/pane-output.log"));
+        assert!(
+            cmd.starts_with("'omp' '-p' 'в Brief'\\'' ${x}; rm'"),
+            "single-quoted with escaped inner quotes: {cmd}"
+        );
+        assert!(
+            cmd.contains(" > >(tee -a '/tmp/d/42/pane-output.log') 2>&1;"),
+            "output teed into the dossier log: {cmd}"
+        );
+        assert!(cmd.ends_with("echo ATLAS_EXIT_42:$?"), "sentinel last: {cmd}");
+        // the regex the watcher polls must NOT match the typed text: the
+        // command line carries the literal `$?`, only the exit line a number
+        assert!(
+            !cmd.contains("ATLAS_EXIT_42:0")
+                && !cmd.contains("ATLAS_EXIT_42:1")
+                && !cmd.contains("ATLAS_EXIT_42:2"),
+            "sentinel must stay numberless in the command: {cmd}"
+        );
+    }
+
+    /// The exit-code parse: the sentinel line's trailing number; anything
+    /// unparsable is `-1` (a failure — never a guess).
+    #[test]
+    fn parse_exit_line_reads_trailing_number() {
+        assert_eq!(parse_exit_line("ATLAS_EXIT_42:0"), 0);
+        assert_eq!(parse_exit_line("ATLAS_EXIT_42:1"), 1);
+        assert_eq!(parse_exit_line("ATLAS_EXIT_42:130"), 130, "SIGINT exit");
+        assert_eq!(parse_exit_line("ATLAS_EXIT_42:$?"), -1, "the echoed form");
+        assert_eq!(parse_exit_line("ATLAS_EXIT_42:"), -1, "empty");
+        assert_eq!(parse_exit_line(""), -1, "no line at all");
+    }
+
+    /// The herdr worker label IS the unit name — one stable item+title
+    /// derivation feeds the unit, the workspace label, cancel and reap.
+    #[test]
+    fn herdr_workspace_label_is_the_unit_name() {
+        assert_eq!(unit_name(7, "починить сборку"), format!("atlas-deleg-{}", slug(7, "починить сборку")));
+    }
+
+    /// The worktree reuse decision: a marker naming THIS item+project is a
+    /// feedback-retry tree (reuse); no/unparsable marker or another item's
+    /// marker is foreign (refuse, never touch).
+    #[test]
+    fn worktree_reuse_reads_the_marker() {
+        let dir = std::env::temp_dir().join(format!("deleg-wt-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // no marker → foreign
+        assert!(!worktree_reusable(&dir, 26, Some("atlas-smoke")));
+        // matching item+project → reuse
+        write_deleg_marker(&dir, 26, "atlas-smoke", Some("task/26-abcd"));
+        assert!(worktree_reusable(&dir, 26, Some("atlas-smoke")));
+        // another item, same project → foreign
+        assert!(!worktree_reusable(&dir, 27, Some("atlas-smoke")));
+        // same item, another project → foreign
+        assert!(!worktree_reusable(&dir, 26, Some("lamplife")));
+        // unparsable marker → foreign
+        std::fs::write(dir.join(DELEG_MARKER), "{not json").expect("write junk");
+        assert!(!worktree_reusable(&dir, 26, Some("atlas-smoke")));
+        // marker without project → foreign
+        std::fs::write(dir.join(DELEG_MARKER), "{\"item\":26}").expect("write partial");
+        assert!(!worktree_reusable(&dir, 26, Some("atlas-smoke")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The orchestrator delegation works in the item's PROJECT directory and

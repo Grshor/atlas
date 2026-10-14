@@ -469,7 +469,8 @@ async function delegPreview(it, target) {
   send.addEventListener('click', async () => {
     send.disabled = true; cancel.disabled = true;
     try {
-      const res = await api('/api/board/item/' + it.id + '/delegate', jsonOpts('POST', { target }));
+      const res = await api('/api/board/item/' + it.id + '/delegate',
+        Object.assign(jsonOpts('POST', { target }), { reason: true }));
       it.delegation = {
         state: (res && res.state) || 'queued',
         target,
@@ -485,7 +486,9 @@ async function delegPreview(it, target) {
     } catch (e) {
       send.disabled = false; cancel.disabled = false;
       const busy = String(e.message).indexOf('409') !== -1;
-      log(busy ? '✗ делегация уже идёт: ' + (it.title || it.id) : '✗ делегировать не удалось: ' + e.message);
+      log(busy
+        ? '✗ делегация уже идёт: ' + (it.title || it.id) + ' — ' + e.message
+        : '✗ делегировать не удалось: ' + e.message);
       if (!busy) probeSet(false);
     }
   });

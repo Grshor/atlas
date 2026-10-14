@@ -76,6 +76,19 @@ pub struct Config {
     /// long think, a big generation) must not die from silence; the owner
     /// watches the live журнал and cancels by hand. `0` = no warn at all.
     pub delegation_silence_warn_secs: u64,
+    /// Where the `omp -p` delegation worker is spawned (`[delegation]
+    /// run_in`): `"systemd"` (the default) keeps the transient-unit spawn —
+    /// prod behavior byte-identical; `"herdr"` runs the worker inside a
+    /// dedicated herdr workspace/pane (`atlas-deleg-<slug>`, same slug as
+    /// the unit name) so the owner watches the raw output live in a
+    /// terminal. The orchestrator rpc child always stays on systemd/direct —
+    /// its rpc stdio is spoken by atlas, a pane tty cannot carry it.
+    pub delegation_run_in: String,
+    /// Herdr toasts for delegation transitions (`[delegation]
+    /// herdr_toasts`, default off): when a run settles (review /
+    /// needs-feedback / failed), atlas fires `herdr notification show` —
+    /// one toast per transition, best-effort, never blocking the settle.
+    pub delegation_herdr_toasts: bool,
     /// omarchy theme colors the panel palette follows.
     pub theme_file: PathBuf,
     /// zen-tabs script behind the `zen` source.
@@ -119,6 +132,8 @@ impl Config {
             delegation_reviewer: String::new(),
             delegation_autopilot: false,
             delegation_silence_warn_secs: 300,
+            delegation_run_in: "systemd".into(),
+            delegation_herdr_toasts: false,
             theme_file: home.join(".local/state/omarchy/current/theme/colors.toml"),
             zen_script: home.join("Projects/ai/zen-tabs/bin/spaces.mjs"),
             voxtype_config: home.join(".config/voxtype/config.toml"),
@@ -179,6 +194,8 @@ struct RawDelegation {
     silence_warn_secs: Option<u64>,
     reviewer: Option<String>,
     autopilot: Option<bool>,
+    run_in: Option<String>,
+    herdr_toasts: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -257,6 +274,12 @@ fn config_from_toml(text: &str) -> Result<Config, String> {
     }
     if let Some(s) = raw.delegation.silence_warn_secs {
         c.delegation_silence_warn_secs = s;
+    }
+    if let Some(r) = raw.delegation.run_in {
+        c.delegation_run_in = r;
+    }
+    if let Some(t) = raw.delegation.herdr_toasts {
+        c.delegation_herdr_toasts = t;
     }
     Ok(c)
 }
@@ -788,6 +811,47 @@ mod tests {
 
         std::fs::write(&p, "[paths]\ndata = \"/d\"\n").expect("write config");
         assert!(!load_config_at(&p).delegation_autopilot, "no section → off");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[delegation] run_in` picks the worker spawn surface; the default
+    /// (and a section-less config) stays on the transient systemd unit —
+    /// prod behavior byte-identical until the config says otherwise.
+    #[test]
+    fn delegation_run_in_key_parses_and_defaults_to_systemd() {
+        assert_eq!(Config::from_home().delegation_run_in, "systemd");
+
+        let dir = tmp_dir("cfg-deleg-runin");
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "[delegation]\nrun_in = \"herdr\"\n").expect("write config");
+        assert_eq!(load_config_at(&p).delegation_run_in, "herdr");
+
+        std::fs::write(&p, "[paths]\ndata = \"/d\"\n").expect("write config");
+        assert_eq!(
+            load_config_at(&p).delegation_run_in,
+            "systemd",
+            "no [delegation] → systemd"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[delegation] herdr_toasts` enables the herdr toast on delegation
+    /// transitions; the default (and a section-less config) stays off —
+    /// prod has no toasts until the config says so.
+    #[test]
+    fn delegation_herdr_toasts_key_parses_and_defaults_off() {
+        assert!(!Config::from_home().delegation_herdr_toasts, "default: off");
+
+        let dir = tmp_dir("cfg-deleg-toasts");
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "[delegation]\nherdr_toasts = true\n").expect("write config");
+        assert!(load_config_at(&p).delegation_herdr_toasts, "explicit true wins");
+
+        std::fs::write(&p, "[paths]\ndata = \"/d\"\n").expect("write config");
+        assert!(
+            !load_config_at(&p).delegation_herdr_toasts,
+            "no [delegation] → off"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
