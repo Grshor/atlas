@@ -1,3 +1,9 @@
+# ⛔ ЗАМОРОЖЕН 2026-10-14
+
+atlas закрыт и заархивирован (тег `archive-2026-10-14`). Наследник — `~/Projects/atlas-v2` (агент-канбан на чужом ядре agent-kanban, борд на `http://127.0.0.1:7777`). Данные перенесены: `scripts/import_atlas.py`. Этот репозиторий и его сервисы (`atlas.service`, `atlas-dev.service`) выключены; копии БД и прогонов — в `archive/`.
+
+---
+
 # atlas
 
 Control panel for daily work: **projects × sessions × vault**. Five always-on
